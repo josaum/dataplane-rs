@@ -1,0 +1,10 @@
+[
+  {
+    "@id": "http://example.org/a",
+    "http://xmlns.com/foaf/0.1/name": [{ "@value": "A" }]
+  },
+  {
+    "@id": "http://example.org/b",
+    "http://xmlns.com/foaf/0.1/name": [{ "@value": "B" }]
+  }
+]

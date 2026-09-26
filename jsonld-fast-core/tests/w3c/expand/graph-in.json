@@ -1,0 +1,9 @@
+{
+  "@context": {
+    "name": "http://xmlns.com/foaf/0.1/name"
+  },
+  "@graph": [
+    { "@id": "http://example.org/a", "name": "A" },
+    { "@id": "http://example.org/b", "name": "B" }
+  ]
+}

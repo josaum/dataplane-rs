@@ -1,0 +1,56 @@
+# Rust guideline compliant 2026-02-21
+[package]
+name = "quad-fast-flight"
+description = "Arrow Flight transport for unsigned quad datasets (UnsignedQuadStream v1)"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+
+[features]
+# Wires the shared `flight-auth` JWT verifier (from `office-parsers-rs`) into
+# `serve_with_verifier`. The path-dependency direction mirrors the precedented
+# `office-parsers-rs -> atlas-reasoner` cross-workspace reuse.
+auth = ["dep:flight-auth"]
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-flight = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+quad-fast-core = { workspace = true }
+thiserror = { workspace = true }
+# `net` is additive on top of the workspace feature set; it is required for
+# binding the Flight listener (`TcpListener` / `TcpListenerStream`).
+tokio = { workspace = true, features = ["net"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true }
+
+flight-auth = { workspace = true, optional = true }
+
+[dev-dependencies]
+oxrdf = { workspace = true }
+
+[lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+undocumented_unsafe_blocks = "warn"
+map_err_ignore = "warn"
+unused_result_ok = "warn"

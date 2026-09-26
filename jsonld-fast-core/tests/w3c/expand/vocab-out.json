@@ -1,0 +1,5 @@
+[
+  {
+    "http://example.org/vocab#term": [{ "@value": "value" }]
+  }
+]

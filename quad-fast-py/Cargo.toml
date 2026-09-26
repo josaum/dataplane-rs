@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "quad-fast-py"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Python bindings for quad-fast-core and jelly-fast-core"
+
+[lib]
+# Mirrors office-parsers-rs/owl-fast-py: a cdylib-only abi3 extension module.
+# The Python-facing module is `quad_fast._native` (see pyproject.toml).
+name = "quad_fast_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+jelly-fast-core = { workspace = true }
+jsonld-fast-core = { workspace = true }
+oxrdf = { workspace = true }
+prost = { workspace = true }
+quad-fast-core = { workspace = true }
+# The dataplane workspace does not pin pyo3 in [workspace.dependencies]
+# (this is the only Python-facing crate), so the version and feature set are
+# pinned here, identical to office-parsers-rs: abi3-py38 keeps one wheel per
+# platform, extension-module skips linking libpython.
+pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py38"] }
+
+[build-dependencies]
+# Emits the macOS `-undefined dynamic_lookup` cdylib link args, same as
+# the released json-fast-py. This is what lets `cargo test --workspace`
+# build this crate on macOS without a libpython to link against.
+pyo3-build-config = "0.28.3"
+
+[lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+undocumented_unsafe_blocks = "warn"
+map_err_ignore = "warn"
+unused_result_ok = "warn"

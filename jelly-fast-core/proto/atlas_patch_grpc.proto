@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: MIT
+//
+// ATLAS-AUTHORED FILE — NOT part of the vendored Jelly schemas.
+//
+// The vendored `patch.proto` (Jelly-RDF @ d1d3088274be36d761617a1228a83d5b697831d6,
+// see PROVENANCE.md) defines the Jelly-Patch messages but no gRPC service,
+// and `RdfPatchOptions` carries no stream/topic name. This file defines the
+// semantic dataplane's own pub/sub service surface for patch frames,
+// modeled on the `RdfStreamService` shape in the vendored `grpc.proto`,
+// with the topic carried explicitly in the publish envelope. It makes no
+// claim of wire interoperability with any upstream Jelly-Patch gRPC
+// protocol.
+syntax = "proto3";
+package atlas.dataplane.jelly.patch.v1;
+
+import "patch.proto";
+
+// Subscribe command sent by the client to the server.
+message PatchSubscribe {
+  // The topic to which the client wants to subscribe (UTF-8 encoded).
+  string topic = 1;
+  // Optional: the patch stream options requested by the client.
+  // The server should respond with a stream that matches these options.
+  // In case that is not possible, the server must respond with the
+  // INVALID_ARGUMENT error.
+  eu.ostrzyciel.jelly.core.proto.v1.patch.RdfPatchOptions requested_options = 2;
+}
+
+// One published message: the topic routing envelope plus a patch frame.
+message PatchPublish {
+  // Topic to publish to. Required (non-empty) on the first message of a
+  // publish stream; later messages may leave it empty or must repeat the
+  // same value. A different non-empty value is an INVALID_ARGUMENT error.
+  string topic = 1;
+  // The patch frame to relay (required on every message).
+  eu.ostrzyciel.jelly.core.proto.v1.patch.RdfPatchFrame frame = 2;
+}
+
+// Acknowledgement of receiving a patch stream, sent by the server.
+message PatchReceived {
+}
+
+// Pub/sub service for Jelly-Patch streams, to be implemented by the server.
+service PatchStreamService {
+  // Subscribe to a patch stream.
+  rpc SubscribePatches (PatchSubscribe) returns (stream eu.ostrzyciel.jelly.core.proto.v1.patch.RdfPatchFrame);
+  // Publish a patch stream.
+  // In case the server cannot process the stream, it must respond with
+  // the INVALID_ARGUMENT error.
+  rpc PublishPatches (stream PatchPublish) returns (PatchReceived);
+}

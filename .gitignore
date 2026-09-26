@@ -1,0 +1,14 @@
+target/
+dist/
+dist-node/
+__pycache__/
+*.pyc
+*.node
+*.so
+*.dylib
+*.dll
+*.tgz
+*.cdx.json
+.DS_Store
+.venv/
+*.egg-info/

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin>=1.6,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "quad-fast"
+version = "0.1.0"
+description = "UnsignedQuadStream v1 quad batches and Jelly frames from Python"
+requires-python = ">=3.9"
+authors = [{ name = "Dionisio Chiuratto Agourakis" }]
+
+[project.urls]
+Homepage = "https://github.com/josaum/dataplane-rs"
+Repository = "https://github.com/josaum/dataplane-rs/tree/main/quad-fast-py"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.maturin]
+module-name = "quad_fast._native"
+python-source = "."
+features = ["pyo3/extension-module"]

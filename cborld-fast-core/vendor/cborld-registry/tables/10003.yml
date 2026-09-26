@@ -1,0 +1,18 @@
+---
+domain: California Instant Identity credentials
+contact:
+  - wes-smith
+  - msporny
+  - dlongley
+  - davidlehn
+mode: default
+provisional: true
+compressionTable:
+  - type: context
+    table:
+      1: https://www.w3.org/ns/credentials/v2
+      2: https://w3id.org/vdl/v1
+      3: https://w3id.org/vdl/aamva/v1
+  - type: https://w3id.org/security#cryptosuiteString
+    table:
+      1: ecdsa-rdfc-2019

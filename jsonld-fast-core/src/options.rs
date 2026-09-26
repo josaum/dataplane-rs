@@ -1,0 +1,94 @@
+// Rust guideline compliant 2026-02-21
+//! Fail-closed processing limits and processor options.
+
+use quad_fast_core::QuadLimits;
+
+/// Default maximum raw input bytes: 64 MiB.
+///
+/// Matches `quad_fast_core::DEFAULT_MAX_RETAINED_TERM_BYTES` so the JSON-LD
+/// plane fails closed at the same scale as the quad plane. Raising it also
+/// raises peak memory roughly proportionally (the document tree is held in
+/// memory during expansion).
+pub const DEFAULT_MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default maximum JSON values visited during expansion.
+///
+/// Matches `quad_fast_core::DEFAULT_MAX_QUADS` so a maximally dense document
+/// cannot out-produce a single quad batch by orders of magnitude.
+pub const DEFAULT_MAX_NODES: usize = 1_048_576;
+
+/// Default maximum expansion nesting depth.
+///
+/// Matches `serde_json`'s own default recursion limit of 128, so documents
+/// that parse are also expandable; deeper nesting would risk stack overflow
+/// in recursive expansion.
+pub const DEFAULT_MAX_DEPTH: usize = 128;
+
+/// Maximum native recursion depth of context processing: 32.
+///
+/// Two chains of the Context Processing and Create Term Definition
+/// algorithms recurse on the *contents* of a context rather than on
+/// document nesting, so [`JsonLdLimits::max_depth`] cannot see them:
+///
+/// - a scoped context validated while a term is defined (JSON-LD 1.1 API
+///   section 4.2.2 step 21.2), and
+/// - a term definition created to resolve another term's prefix (section
+///   4.2.2 step 14, via IRI expansion) — `{"a": "b:x", "b": "c:x", ...}`
+///   is **flat** JSON of arbitrary chain length.
+///
+/// Both are refused past this depth with
+/// [`crate::JsonLdError::ResourceLimit`] and
+/// [`crate::JsonLdResource::ContextRecursion`]. The bound is a constant,
+/// not a caller-tunable limit, because it governs the native stack rather
+/// than payload size: raising it cannot be made safe by the caller. Real
+/// contexts nest a prefix one or two levels deep, so 32 is far above any
+/// legitimate document and far below the depth at which an unoptimized
+/// build runs out of stack.
+pub const MAX_CONTEXT_RECURSION: usize = 32;
+
+/// Fail-closed limits for one JSON-LD processing run.
+#[derive(Clone, Copy, Debug)]
+pub struct JsonLdLimits {
+    /// Maximum raw UTF-8 input bytes accepted by [`crate::parse_document`].
+    pub max_input_bytes: usize,
+    /// Maximum JSON values (objects, arrays, scalars) visited in expansion.
+    pub max_nodes: usize,
+    /// Maximum nesting depth reached during expansion.
+    pub max_depth: usize,
+}
+
+impl Default for JsonLdLimits {
+    fn default() -> Self {
+        Self {
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_nodes: DEFAULT_MAX_NODES,
+            max_depth: DEFAULT_MAX_DEPTH,
+        }
+    }
+}
+
+/// Options for expansion, compaction, framing, and RDF deserialization.
+#[derive(Clone, Debug)]
+pub struct JsonLdOptions {
+    /// Base IRI used to resolve relative IRI references (`@base` overrides).
+    pub base: Option<String>,
+    /// Fail-closed JSON-LD processing limits.
+    pub limits: JsonLdLimits,
+    /// Fail-closed limits for the produced quad batch.
+    pub quad_limits: QuadLimits,
+    /// The `compactArrays` API option (JSON-LD 1.1 API section 6.1):
+    /// when `true` (the default), single-element arrays whose term has no
+    /// `@set`/`@list` container compact to their only element.
+    pub compact_arrays: bool,
+}
+
+impl Default for JsonLdOptions {
+    fn default() -> Self {
+        Self {
+            base: None,
+            limits: JsonLdLimits::default(),
+            quad_limits: QuadLimits::default(),
+            compact_arrays: true,
+        }
+    }
+}

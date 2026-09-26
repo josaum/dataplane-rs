@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "quad-fast-node"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Node bindings for quad-fast-core and jelly-fast-core"
+
+[lib]
+name = "quad_fast_node"
+crate-type = ["cdylib"]
+
+[dependencies]
+quad-fast-core = { workspace = true }
+jelly-fast-core = { workspace = true }
+arrow-array = { workspace = true }
+oxrdf = { workspace = true }
+prost = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+# napi is not in workspace.dependencies (this is the only Node crate in the
+# dataplane); pins mirror office-parsers-rs/json-fast-node exactly.
+napi = { version = "2", features = ["serde-json"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2.2.0"
+
+[lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+undocumented_unsafe_blocks = "warn"
+map_err_ignore = "warn"
+unused_result_ok = "warn"

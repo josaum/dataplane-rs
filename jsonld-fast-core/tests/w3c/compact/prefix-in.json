@@ -1,0 +1,6 @@
+[
+  {
+    "@id": "http://example.org/people#alice",
+    "http://xmlns.com/foaf/0.1/name": [{ "@value": "Alice" }]
+  }
+]

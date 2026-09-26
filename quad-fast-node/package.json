@@ -1,0 +1,45 @@
+{
+  "name": "quad-fast-node",
+  "version": "0.1.0",
+  "description": "Node bindings for the UnsignedQuadStream v1 Arrow contract and the Jelly RDF frame codec",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "napi": {
+    "name": "quad_fast_node"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "scripts": {
+    "test": "node smoke.test.mjs"
+  },
+  "keywords": [
+    "rdf",
+    "quads",
+    "arrow",
+    "arrow-ipc",
+    "jelly",
+    "jsonld",
+    "napi",
+    "rust",
+    "native",
+    "performance"
+  ]
+}

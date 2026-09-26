@@ -1,0 +1,42 @@
+[package]
+name = "jelly-fast-grpc"
+description = "Jelly gRPC RdfStreamService pub/sub over the jelly-fast-core frame codec"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+
+[dependencies]
+arrow-array = { workspace = true }
+futures = { workspace = true }
+jelly-fast-core = { workspace = true }
+quad-fast-core = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+tokio-stream = { workspace = true, features = ["net", "sync"] }
+tonic = { workspace = true }
+
+[dev-dependencies]
+oxrdf = { workspace = true }
+
+[lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+undocumented_unsafe_blocks = "warn"
+map_err_ignore = "warn"
+unused_result_ok = "warn"

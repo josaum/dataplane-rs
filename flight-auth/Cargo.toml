@@ -1,0 +1,20 @@
+[package]
+name = "flight-auth"
+description = "Dependency-light authentication for Arrow Flight request metadata"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+jsonwebtoken = "=9.3.1"
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+tonic = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true

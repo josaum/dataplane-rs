@@ -1,0 +1,66 @@
+{
+  "description": "Curated inline-context subset of the W3C JSON-LD 1.1 API test suite. Remote-context tests are represented by a refusal fixture; this processor never fetches.",
+  "sequence": [
+    {
+      "id": "#expand-prefix",
+      "type": "jld:ExpandTest",
+      "input": "expand/prefix-in.json",
+      "expect": "expand/prefix-out.json"
+    },
+    {
+      "id": "#expand-vocab",
+      "type": "jld:ExpandTest",
+      "input": "expand/vocab-in.json",
+      "expect": "expand/vocab-out.json"
+    },
+    {
+      "id": "#expand-type-coercion",
+      "type": "jld:ExpandTest",
+      "input": "expand/type-coercion-in.json",
+      "expect": "expand/type-coercion-out.json"
+    },
+    {
+      "id": "#expand-language",
+      "type": "jld:ExpandTest",
+      "input": "expand/language-in.json",
+      "expect": "expand/language-out.json"
+    },
+    {
+      "id": "#expand-graph",
+      "type": "jld:ExpandTest",
+      "input": "expand/graph-in.json",
+      "expect": "expand/graph-out.json"
+    },
+    {
+      "id": "#expand-list",
+      "type": "jld:ExpandTest",
+      "input": "expand/list-in.json",
+      "expect": "expand/list-out.json"
+    },
+    {
+      "id": "#expand-drop-id-only",
+      "type": "jld:ExpandTest",
+      "input": "expand/drop-id-only-in.json",
+      "expect": "expand/drop-id-only-out.json"
+    },
+    {
+      "id": "#compact-prefix",
+      "type": "jld:CompactTest",
+      "input": "compact/prefix-in.json",
+      "context": "compact/prefix-context.json",
+      "expect": "compact/prefix-out.json"
+    },
+    {
+      "id": "#flatten-embed",
+      "type": "jld:FlattenTest",
+      "input": "flatten/embed-in.json",
+      "expect": "flatten/embed-out.json"
+    },
+    {
+      "id": "#remote-context-refused",
+      "type": "jld:ExpandTest",
+      "input": "expand/remote-context-in.json",
+      "expectErrorCode": "remote_context_refused"
+    }
+  ]
+}

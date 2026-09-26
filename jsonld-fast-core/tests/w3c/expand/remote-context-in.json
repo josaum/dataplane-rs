@@ -1,0 +1,5 @@
+{
+  "@context": "https://example.org/remote-context.jsonld",
+  "@id": "http://example.org/test#example",
+  "name": "Alice"
+}

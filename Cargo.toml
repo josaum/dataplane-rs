@@ -1,0 +1,87 @@
+[workspace]
+members = [
+  "quad-fast-core",
+  "jelly-fast-core",
+  "jelly-fast-grpc",
+  "jsonld-fast-core",
+  "cborld-fast-core",
+  "quad-fast-flight",
+  "quad-fast-py",
+  "quad-fast-node",
+  "flight-auth",
+]
+default-members = [
+  "quad-fast-core",
+  "jelly-fast-core",
+  "jelly-fast-grpc",
+  "jsonld-fast-core",
+  "cborld-fast-core",
+  "quad-fast-flight",
+  "quad-fast-py",
+  "quad-fast-node",
+  "flight-auth",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Dionisio Chiuratto Agourakis"]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/josaum/dataplane-rs"
+rust-version = "1.94"
+publish = false
+
+[workspace.dependencies]
+arrow = { version = "=58.3.0", features = ["ipc_compression"] }
+arrow-array = "=58.3.0"
+arrow-buffer = "=58.3.0"
+arrow-flight = "=58.3.0"
+arrow-ipc = { version = "=58.3.0", features = ["lz4", "zstd"] }
+arrow-schema = "=58.3.0"
+bytes = "1"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+futures = "0.3"
+oxrdf = { version = "0.3", features = ["rdf-12"] }
+prost = "0.14"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-stream = "0.1"
+tonic = { version = "0.14.2", features = ["transport"] }
+tonic-prost = "0.14.2"
+tonic-prost-build = "0.14.2"
+napi = { version = "2.16", features = ["serde-json"] }
+napi-derive = "2.16"
+napi-build = "2.2"
+pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py38"] }
+
+quad-fast-core = { path = "quad-fast-core" }
+jelly-fast-core = { path = "jelly-fast-core" }
+jsonld-fast-core = { path = "jsonld-fast-core" }
+cborld-fast-core = { path = "cborld-fast-core" }
+flight-auth = { path = "flight-auth" }
+
+[workspace.lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
