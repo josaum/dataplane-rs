@@ -547,20 +547,19 @@ impl AuthConfig {
             }
         }
 
-        if self.allow_legacy_hs256 {
-            if let Some(secret) = self
+        if self.allow_legacy_hs256
+            && let Some(secret) = self
                 .legacy_hs256_secret
                 .as_deref()
                 .and_then(canonical_hs256_secret)
-            {
-                let validation = self.validation(Algorithm::HS256);
-                if let Ok(data) = decode::<AuthClaim>(
-                    token,
-                    &DecodingKey::from_secret(secret.as_bytes()),
-                    &validation,
-                ) {
-                    return Self::validate_claim_policy(data.claims);
-                }
+        {
+            let validation = self.validation(Algorithm::HS256);
+            if let Ok(data) = decode::<AuthClaim>(
+                token,
+                &DecodingKey::from_secret(secret.as_bytes()),
+                &validation,
+            ) {
+                return Self::validate_claim_policy(data.claims);
             }
         }
 

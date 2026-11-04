@@ -529,8 +529,8 @@ fn parse_sha256_hex(hex: &str, what: &str) -> Result<[u8; 32], BindingError> {
         }
     }
     let mut digest = [0u8; 32];
-    for (index, chunk) in bytes.chunks_exact(2).enumerate() {
-        let (Some(high), Some(low)) = (nibble(chunk[0]), nibble(chunk[1])) else {
+    for (index, &[hi, lo]) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        let (Some(high), Some(low)) = (nibble(hi), nibble(lo)) else {
             return Err(BindingError::Input(format!(
                 "{what} contains a non-hex character"
             )));
