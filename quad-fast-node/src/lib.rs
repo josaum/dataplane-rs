@@ -6,7 +6,7 @@
 //! Mirrors the `office-parsers-rs/json-fast-node` house pattern (napi 2 +
 //! napi-derive 2, cdylib, `napi_build::setup()`): JavaScript passes plain
 //! objects and `Buffer`s across the boundary, and every `#[napi]` function is
-//! a one-line delegation into the napi-free [`convert`] layer so the whole
+//! a one-line delegation into the napi-free `convert` layer so the whole
 //! surface is unit-testable from `cargo test` without a Node runtime or a
 //! built `.node` artifact.
 //!
@@ -24,7 +24,7 @@
 //! `dataplane.assurance = "unsigned"` and nothing in this binding attaches,
 //! claims, or upgrades assurance. Every function takes an
 //! optional fail-closed options object (unknown keys are typed errors); see
-//! [`convert`] for the quad object shape and `index.d.ts` for the TypeScript
+//! `convert` for the quad object shape and `index.d.ts` for the TypeScript
 //! surface. Errors surface in JS as exceptions whose message starts with a
 //! stable machine-readable code (`input:`, `resource_limit:`, ...).
 //!
