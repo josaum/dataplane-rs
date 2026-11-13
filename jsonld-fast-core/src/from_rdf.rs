@@ -26,7 +26,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     error::{JsonLdError, JsonLdResource},
-    options::{DEFAULT_MAX_DEPTH, DEFAULT_MAX_NODES},
+    options::JsonLdLimits,
     to_rdf::{I18N_NAMESPACE, RDF_FIRST, RDF_JSON, RDF_NIL, RDF_REST, RDF_TYPE, XSD_STRING},
 };
 
@@ -45,8 +45,12 @@ struct NodeAcc {
 /// # Errors
 ///
 /// Returns [`JsonLdError::Quad`] when a batch fails `UnsignedQuadStream`
-/// contract validation or a row does not decode to a valid quad.
-pub(crate) fn quads_to_expanded(batches: &[RecordBatch]) -> Result<Value, JsonLdError> {
+/// contract validation or a row does not decode to a valid quad, and the
+/// list budgets of `limits` described on [`reassemble_lists`].
+pub(crate) fn quads_to_expanded(
+    batches: &[RecordBatch],
+    limits: &JsonLdLimits,
+) -> Result<Value, JsonLdError> {
     // Graph key `None` is the default graph.
     let mut graphs: BTreeMap<Option<String>, BTreeMap<String, NodeAcc>> = BTreeMap::new();
     for batch in batches {
@@ -91,14 +95,15 @@ pub(crate) fn quads_to_expanded(batches: &[RecordBatch]) -> Result<Value, JsonLd
     }
 
     let mut default_nodes = graphs.remove(&None).unwrap_or_default();
-    reassemble_lists(&mut default_nodes)?;
+    let mut budget = ListBudget::new(limits);
+    reassemble_lists(&mut default_nodes, &mut budget)?;
     // Every named graph needs a carrier node in the default graph.
     let named_graph_names: Vec<String> = graphs.keys().flatten().cloned().collect();
     for name in &named_graph_names {
         default_nodes.entry(name.clone()).or_default();
     }
     for graph_nodes in graphs.values_mut() {
-        reassemble_lists(graph_nodes)?;
+        reassemble_lists(graph_nodes, &mut budget)?;
     }
 
     let mut output = Vec::with_capacity(default_nodes.len());
@@ -254,11 +259,16 @@ fn render_node(id: &str, node: &NodeAcc) -> Value {
 /// # Errors
 ///
 /// [`JsonLdError::ResourceLimit`] with [`JsonLdResource::Depth`] when lists
-/// nest deeper than [`DEFAULT_MAX_DEPTH`] (flat quads would otherwise build
-/// an arbitrarily deep value), and with [`JsonLdResource::Nodes`] when the
-/// values copied into nested and shared lists exceed [`DEFAULT_MAX_NODES`]
-/// (a list head referenced twice from each level doubles per level).
-fn reassemble_lists(nodes: &mut BTreeMap<String, NodeAcc>) -> Result<(), JsonLdError> {
+/// nest deeper than [`JsonLdLimits::max_depth`] (flat quads would otherwise
+/// build an arbitrarily deep value), and with [`JsonLdResource::Nodes`]
+/// when repeated copies of shared lists exceed [`JsonLdLimits::max_nodes`]
+/// (a list head referenced twice from each level doubles per level). The
+/// first use of each list is free: its values come from the input's own
+/// quads, so only duplication is charged.
+fn reassemble_lists(
+    nodes: &mut BTreeMap<String, NodeAcc>,
+    budget: &mut ListBudget,
+) -> Result<(), JsonLdError> {
     let list_nodes: HashSet<String> = nodes
         .iter()
         .filter(|(_, node)| is_list_node(node))
@@ -300,7 +310,7 @@ fn reassemble_lists(nodes: &mut BTreeMap<String, NodeAcc>) -> Result<(), JsonLdE
         }
     }
 
-    let (mut replacements, mut copied) = resolve_nested_lists(replacements, &mut consumed, nodes)?;
+    let mut replacements = resolve_nested_lists(replacements, &mut consumed, nodes, budget)?;
     keep_unreferenced_lists(&mut replacements, &mut consumed, nodes);
 
     for (id, node) in nodes.iter_mut() {
@@ -322,14 +332,7 @@ fn reassemble_lists(nodes: &mut BTreeMap<String, NodeAcc>) -> Result<(), JsonLdE
                     continue;
                 };
                 if let Some((list, size)) = replacements.get(id) {
-                    copied = copied.saturating_add(*size);
-                    if copied > DEFAULT_MAX_NODES {
-                        return Err(JsonLdError::ResourceLimit {
-                            resource: JsonLdResource::Nodes,
-                            limit: DEFAULT_MAX_NODES,
-                            observed: copied,
-                        });
-                    }
+                    budget.use_list(id, *size)?;
                     *value = list.clone();
                 } else if id == RDF_NIL && !is_first {
                     *value = empty_list();
@@ -397,6 +400,47 @@ fn keep_unreferenced_lists(
     }
 }
 
+/// Charges list copies in `fromRdf` against [`JsonLdLimits`].
+#[derive(Debug)]
+struct ListBudget {
+    /// Lists already placed once (their first use is not charged).
+    used: HashSet<String>,
+    /// Values produced by second and later uses.
+    copied: usize,
+    max_nodes: usize,
+    max_depth: usize,
+}
+
+impl ListBudget {
+    fn new(limits: &JsonLdLimits) -> Self {
+        Self {
+            used: HashSet::new(),
+            copied: 0,
+            max_nodes: limits.max_nodes,
+            max_depth: limits.max_depth,
+        }
+    }
+
+    /// Charges placing the list headed by `head` (holding `size` values).
+    ///
+    /// The first placement is free; every later one copies `size` values
+    /// and is charged before the copy is made.
+    fn use_list(&mut self, head: &str, size: usize) -> Result<(), JsonLdError> {
+        if self.used.insert(head.to_owned()) {
+            return Ok(());
+        }
+        self.copied = self.copied.saturating_add(size);
+        if self.copied > self.max_nodes {
+            return Err(JsonLdError::ResourceLimit {
+                resource: JsonLdResource::Nodes,
+                limit: self.max_nodes,
+                observed: self.copied,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Per-head facts gathered by [`resolve_nested_lists`].
 #[derive(Debug, Default)]
 struct HeadFacts {
@@ -418,7 +462,8 @@ fn resolve_nested_lists(
     replacements: BTreeMap<String, Value>,
     consumed: &mut HashSet<String>,
     nodes: &BTreeMap<String, NodeAcc>,
-) -> Result<(ResolvedLists, usize), JsonLdError> {
+    budget: &mut ListBudget,
+) -> Result<ResolvedLists, JsonLdError> {
     let children = |head: &str| -> Vec<String> {
         replacements
             .get(head)
@@ -468,18 +513,11 @@ fn resolve_nested_lists(
                     .map_or(0, Vec::len)
                     .saturating_sub(items);
                 size = size.saturating_add(plain);
-                if depth > DEFAULT_MAX_DEPTH {
+                if depth > budget.max_depth {
                     return Err(JsonLdError::ResourceLimit {
                         resource: JsonLdResource::Depth,
-                        limit: DEFAULT_MAX_DEPTH,
+                        limit: budget.max_depth,
                         observed: depth,
-                    });
-                }
-                if size > DEFAULT_MAX_NODES {
-                    return Err(JsonLdError::ResourceLimit {
-                        resource: JsonLdResource::Nodes,
-                        limit: DEFAULT_MAX_NODES,
-                        observed: size,
                     });
                 }
                 facts.insert(head.clone(), HeadFacts { depth, size });
@@ -505,22 +543,6 @@ fn resolve_nested_lists(
         }
     }
 
-    // Every resolved head is materialized once and copied once per
-    // reference; charge those copies before making them.
-    let mut copied = 0_usize;
-    for (head, fact) in &facts {
-        if !cyclic.contains(head) {
-            copied = copied.saturating_add(fact.size);
-        }
-    }
-    if copied > DEFAULT_MAX_NODES {
-        return Err(JsonLdError::ResourceLimit {
-            resource: JsonLdResource::Nodes,
-            limit: DEFAULT_MAX_NODES,
-            observed: copied,
-        });
-    }
-
     let mut remaining = replacements;
     let mut resolved: ResolvedLists = BTreeMap::new();
     for head in order {
@@ -535,7 +557,8 @@ fn resolve_nested_lists(
                 let Some(id) = value_id(item) else {
                     continue;
                 };
-                if let Some((nested, _)) = resolved.get(id) {
+                if let Some((nested, size)) = resolved.get(id) {
+                    budget.use_list(id, *size)?;
                     *item = nested.clone();
                 }
             }
@@ -555,7 +578,7 @@ fn resolve_nested_lists(
             current = next.to_owned();
         }
     }
-    Ok((resolved, copied))
+    Ok(resolved)
 }
 
 fn empty_list() -> Value {

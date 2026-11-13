@@ -366,7 +366,28 @@ pub fn to_quads(
 /// # Errors
 ///
 /// Returns [`JsonLdError::Quad`] when a batch fails contract validation or
-/// a row does not decode to a valid quad.
+/// a row does not decode to a valid quad, and [`JsonLdError::ResourceLimit`]
+/// when lists nest deeper than [`DEFAULT_MAX_DEPTH`] or repeated copies of
+/// shared lists exceed [`DEFAULT_MAX_NODES`] values; use
+/// [`from_quads_with_limits`] to raise them.
 pub fn from_quads(batches: &[RecordBatch]) -> Result<Value, JsonLdError> {
-    from_rdf::quads_to_expanded(batches)
+    from_rdf::quads_to_expanded(batches, &JsonLdLimits::default())
+}
+
+/// [`from_quads`] with caller-chosen list budgets.
+///
+/// Well-formed `rdf:first`/`rdf:rest` chains become `@list` arrays. Lists
+/// may nest at most [`JsonLdLimits::max_depth`] deep, and copies made
+/// because one list is referenced from several places may total at most
+/// [`JsonLdLimits::max_nodes`] values (the first use of each list is not
+/// charged). [`from_quads`] uses [`JsonLdLimits::default`].
+///
+/// # Errors
+///
+/// The errors of [`from_quads`], with the limits taken from `limits`.
+pub fn from_quads_with_limits(
+    batches: &[RecordBatch],
+    limits: &JsonLdLimits,
+) -> Result<Value, JsonLdError> {
+    from_rdf::quads_to_expanded(batches, limits)
 }

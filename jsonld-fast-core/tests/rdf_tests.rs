@@ -440,3 +440,114 @@ fn unreferenced_list_survives_from_rdf() {
     let expanded = from_quads(&original).expect("fromRdf succeeds");
     assert_eq!(quad_lines(&quads(&expanded)), quad_lines(&original));
 }
+
+/// Legal list-heavy RDF must not be refused for its lists: 270,000
+/// single-item lists (810,000 quads) each produce two values once, far
+/// below `max_nodes`, and none is copied twice.
+#[test]
+fn many_single_item_lists_are_accepted() {
+    use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Quad};
+    use quad_fast_core::{QuadBatchBuilder, QuadLimits};
+
+    const LISTS: usize = 270_000;
+    let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let first = NamedNode::new(format!("{rdf}first")).expect("iri");
+    let rest = NamedNode::new(format!("{rdf}rest")).expect("iri");
+    let nil = NamedNode::new(format!("{rdf}nil")).expect("iri");
+    let property = NamedNode::new("http://example.com/p").expect("iri");
+    let mut builder = QuadBatchBuilder::new(QuadLimits::default());
+    for index in 0..LISTS {
+        let subject = NamedNode::new(format!("http://example.com/s{index}")).expect("iri");
+        let head = BlankNode::new(format!("l{index}")).expect("label");
+        let quads = [
+            Quad::new(
+                subject,
+                property.clone(),
+                head.clone(),
+                GraphName::DefaultGraph,
+            ),
+            Quad::new(
+                head.clone(),
+                first.clone(),
+                Literal::new_simple_literal("x"),
+                GraphName::DefaultGraph,
+            ),
+            Quad::new(head, rest.clone(), nil.clone(), GraphName::DefaultGraph),
+        ];
+        for quad in &quads {
+            builder
+                .push(quad.as_ref(), None)
+                .expect("within quad limits");
+        }
+    }
+    let batches = vec![builder.finish().expect("batch")];
+    let expanded = from_quads(&batches).expect("legal lists are accepted");
+    assert_eq!(expanded.as_array().map(Vec::len), Some(LISTS));
+}
+
+/// A list whose two items are both the next list, 40 levels deep, would
+/// copy 2^40 values on `fromRdf`; repeated copies are charged against
+/// `max_nodes` and refused long before that.
+#[test]
+fn shared_nested_lists_are_refused_by_copy_budget() {
+    use oxrdf::{BlankNode, GraphName, NamedNode, Quad};
+    use quad_fast_core::{QuadBatchBuilder, QuadLimits};
+
+    let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let first = NamedNode::new(format!("{rdf}first")).expect("iri");
+    let rest = NamedNode::new(format!("{rdf}rest")).expect("iri");
+    let nil = NamedNode::new(format!("{rdf}nil")).expect("iri");
+    let mut builder = QuadBatchBuilder::new(QuadLimits::default());
+    let mut push = |quad: Quad| builder.push(quad.as_ref(), None).expect("within limits");
+    push(Quad::new(
+        NamedNode::new("http://example.com/s").expect("iri"),
+        NamedNode::new("http://example.com/p").expect("iri"),
+        BlankNode::new("l0").expect("label"),
+        GraphName::DefaultGraph,
+    ));
+    for level in 0..40 {
+        let head = BlankNode::new(format!("l{level}")).expect("label");
+        let second = BlankNode::new(format!("m{level}")).expect("label");
+        let next = BlankNode::new(format!("l{}", level + 1)).expect("label");
+        push(Quad::new(
+            head.clone(),
+            first.clone(),
+            next.clone(),
+            GraphName::DefaultGraph,
+        ));
+        push(Quad::new(
+            head,
+            rest.clone(),
+            second.clone(),
+            GraphName::DefaultGraph,
+        ));
+        push(Quad::new(
+            second.clone(),
+            first.clone(),
+            next,
+            GraphName::DefaultGraph,
+        ));
+        push(Quad::new(
+            second,
+            rest.clone(),
+            nil.clone(),
+            GraphName::DefaultGraph,
+        ));
+    }
+    let last = BlankNode::new("l40").expect("label");
+    push(Quad::new(
+        last.clone(),
+        first.clone(),
+        oxrdf::Literal::new_simple_literal("x"),
+        GraphName::DefaultGraph,
+    ));
+    push(Quad::new(
+        last,
+        rest.clone(),
+        nil.clone(),
+        GraphName::DefaultGraph,
+    ));
+    let batches = vec![builder.finish().expect("batch")];
+    let error = from_quads(&batches).expect_err("exponential copies are refused");
+    assert_eq!(error.code(), "resource_limit", "{error}");
+}
