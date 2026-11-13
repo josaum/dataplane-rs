@@ -10,7 +10,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-jsonwebtoken = "=9.3.1"
+jsonwebtoken = "=11.1.0"
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 tonic = { workspace = true }
