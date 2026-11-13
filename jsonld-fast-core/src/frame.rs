@@ -103,6 +103,7 @@ pub(crate) fn frame_document(
         frame: &frame_object,
         context_value: &context_value,
         options,
+        output_budget: document_budget,
     };
 
     // Embedding follows references in the node map, not document nesting:
@@ -123,6 +124,8 @@ struct FramingRun<'run> {
     frame: &'run Map<String, Value>,
     context_value: &'run Value,
     options: &'run JsonLdOptions,
+    /// Output budget of the framed document's compaction.
+    output_budget: usize,
 }
 
 /// Why a framing run stopped.
@@ -175,6 +178,7 @@ impl FramingRun<'_> {
             &Value::Array(results),
             self.context_value,
             self.options,
+            self.output_budget,
         )
         .map_err(FrameAbort::Failed)?;
         let cleaned = cleanup_preserved(compacted);

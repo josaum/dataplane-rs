@@ -304,7 +304,7 @@ pub fn compact(
                 .unwrap_or_else(|| Value::Object(map.clone())),
             other => other.clone(),
         };
-        let compacted = compact::compact_expanded(&expanded, &context_value, options)?;
+        let compacted = compact::compact_expanded(&expanded, &context_value, options, budget)?;
         Ok(compact::attach_context(compacted, &context_value))
     })
 }
