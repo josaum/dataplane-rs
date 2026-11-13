@@ -49,12 +49,39 @@ pub const DEFAULT_MAX_STORE_BYTES: usize = 4 << 30;
 /// `DEFAULT_MAX_BATCHES_PER_DATASET` upload with room to spare.
 pub const DEFAULT_MAX_MESSAGES_PER_STREAM: usize = 65_536;
 
-/// Default maximum encoded gRPC message, in either direction: 4 MiB.
+/// Default maximum encoded gRPC message the server sends: 4 MiB.
 ///
-/// This is tonic's own decoding default, stated explicitly and applied to
-/// encoding as well (tonic's encoding default is unbounded). `DoGet` output
-/// stays under it because the Flight encoder splits batches at 2 MiB.
+/// tonic's own decoding default, so a default client can read everything the
+/// server sends (tonic's encoding default is unbounded). The server *accepts*
+/// slightly less: see [`decode_limit`]. The Flight encoder splits batches by
+/// rows only, so a single large row is re-encoded whole; re-encoding also
+/// changes buffer alignment (a client may write 8-byte alignment, the server
+/// writes 64-byte), so a re-encoded message can be a few KiB larger than the
+/// one received.
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Most headroom kept between the decode and encode limits: 64 KiB.
+///
+/// Re-encoding at 64-byte alignment adds at most 56 bytes of padding per
+/// buffer; a contract batch has about 30 buffers, so under 2 KiB, plus a
+/// rewritten flatbuffer header. 64 KiB leaves a wide margin.
+const MAX_REENCODE_HEADROOM: usize = 64 * 1024;
+
+/// Largest gRPC message the server accepts for a given send limit.
+///
+/// `max_message_bytes` minus a headroom of 64 KiB (or a sixteenth of the
+/// limit, if smaller), so that anything `DoPut` accepts can be re-encoded
+/// for `DoGet` and `DoExchange` within `max_message_bytes`.
+#[must_use]
+pub const fn decode_limit(max_message_bytes: usize) -> usize {
+    let sixteenth = max_message_bytes / 16;
+    let headroom = if sixteenth < MAX_REENCODE_HEADROOM {
+        sixteenth
+    } else {
+        MAX_REENCODE_HEADROOM
+    };
+    max_message_bytes - headroom
+}
 
 /// Default maximum dataset name length, in bytes.
 ///
@@ -96,7 +123,8 @@ pub struct DatasetLimits {
     pub max_store_bytes: usize,
     /// Maximum `FlightData` messages in one ingest stream.
     pub max_messages_per_stream: usize,
-    /// Maximum encoded gRPC message size, applied to decoding and encoding.
+    /// Maximum encoded gRPC message the server sends; it accepts
+    /// [`decode_limit`] of this, so every accepted message fits on the way out.
     pub max_message_bytes: usize,
     /// Maximum dataset name length, in bytes.
     pub max_name_bytes: usize,

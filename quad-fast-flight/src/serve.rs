@@ -5,6 +5,19 @@
 //! unless its verifier actually requires authentication with a configured
 //! issuer and audience, and the unauthenticated [`serve`] and
 //! [`serve_with_limits`] refuse every address that is not loopback.
+//!
+//! What these entry points do not do:
+//!
+//! - **TLS.** The transport is plaintext HTTP/2; put it behind a
+//!   TLS-terminating proxy or a service mesh.
+//! - **Tenant scoping.** Any token with `flight:invoke` can read, drop or
+//!   `reset` any dataset.
+//! - **Expiry of open streams.** A token is checked when a stream opens; an
+//!   open stream outlives the token's `exp`.
+//!
+//! The store byte budget counts encoded wire bytes (`FlightData` header plus
+//! body as received), and a dataset stays charged until its last reader is
+//! gone.
 
 use std::{net::SocketAddr, time::Duration};
 
@@ -15,7 +28,10 @@ use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{service::interceptor::InterceptedService, transport::Server};
 
-use crate::{limits::DatasetLimits, service::QuadFlightService};
+use crate::{
+    limits::{DatasetLimits, decode_limit},
+    service::QuadFlightService,
+};
 
 /// Interval between HTTP/2 keepalive pings sent to an idle peer.
 ///
@@ -179,7 +195,9 @@ async fn spawn(
     let local_addr = listener.local_addr().map_err(ServeError::Bind)?;
     let (shutdown, signal) = oneshot::channel::<()>();
     let flight = FlightServiceServer::new(QuadFlightService::new(limits))
-        .max_decoding_message_size(limits.max_message_bytes)
+        // Accept slightly less than we send, so a re-encoded single-row batch
+        // (which the Flight encoder cannot split) always fits on the way out.
+        .max_decoding_message_size(decode_limit(limits.max_message_bytes))
         .max_encoding_message_size(limits.max_message_bytes);
     let service = InterceptedService::new(flight, move |request: tonic::Request<()>| {
         if let Some(verifier) = &verifier {

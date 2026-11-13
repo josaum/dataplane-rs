@@ -2,12 +2,94 @@
 //! In-memory store of unsigned quad datasets with atomic replacement.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use quad_fast_core::UnsignedQuadBatch;
 use tonic::Status;
 
 use crate::limits::DatasetLimits;
+
+/// Bytes charged against the store-wide budget: stored, in flight, and
+/// still held by readers.
+#[derive(Debug, Default)]
+pub(crate) struct ByteBudget {
+    used: AtomicUsize,
+}
+
+impl ByteBudget {
+    /// Charges `bytes` when the total stays within `limit`.
+    fn try_charge(&self, bytes: usize, limit: usize) -> bool {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= limit)
+            })
+            .is_ok()
+    }
+
+    /// Returns `bytes` to the budget.
+    fn release(&self, bytes: usize) {
+        // Saturating: a release never exceeds what was charged, but an
+        // underflow here must not wrap into an exhausted budget.
+        let _ = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+}
+
+/// The bytes one dataset holds against the store budget.
+///
+/// Created when its upload starts and charged message by message. It lives
+/// as long as the last holder of the dataset's batches: the upload, the
+/// stored [`Dataset`], and every `DoGet` stream reading it share one
+/// [`Arc`]. Dropping or replacing a dataset therefore frees its bytes only
+/// once no reader still holds them.
+#[derive(Debug)]
+pub(crate) struct Reservation {
+    budget: Arc<ByteBudget>,
+    limits: DatasetLimits,
+    charged: AtomicUsize,
+}
+
+impl Reservation {
+    /// Starts an empty charge against `budget`.
+    pub(crate) fn new(budget: Arc<ByteBudget>, limits: DatasetLimits) -> Self {
+        Self {
+            budget,
+            limits,
+            charged: AtomicUsize::new(0),
+        }
+    }
+
+    /// Charges one received message against the dataset and store budgets.
+    pub(crate) fn charge(&self, bytes: usize) -> Result<(), Status> {
+        let dataset = self.charged.load(Ordering::Acquire).saturating_add(bytes);
+        if dataset > self.limits.max_dataset_bytes {
+            return Err(Status::resource_exhausted(format!(
+                "resource_limit: dataset_bytes: observed {dataset} exceeds limit {}",
+                self.limits.max_dataset_bytes
+            )));
+        }
+        if !self.budget.try_charge(bytes, self.limits.max_store_bytes) {
+            return Err(Status::resource_exhausted(format!(
+                "resource_limit: store_bytes: store would exceed its limit of {} bytes",
+                self.limits.max_store_bytes
+            )));
+        }
+        self.charged.store(dataset, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.budget.release(self.charged.load(Ordering::Acquire));
+    }
+}
 
 /// One fully ingested, contract-validated, unsigned dataset.
 ///
@@ -16,15 +98,19 @@ use crate::limits::DatasetLimits;
 /// Batches are [`UnsignedQuadBatch`]: a reasoner composite `RecordBatch`
 /// cannot be stored without passing `try_from_batch`, and [`Clone`] of a
 /// dataset only aliases Arrow buffers — it is not a signature.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Dataset {
     /// Contract-valid batches in arrival order.
     pub(crate) batches: Vec<UnsignedQuadBatch>,
     /// Total quads across all batches.
     pub(crate) total_quads: u64,
-    /// Encoded bytes received for this dataset, as charged to the store
-    /// byte budget; released when the dataset is replaced or dropped.
-    pub(crate) bytes: usize,
+    /// The dataset's charge against the store byte budget, released when
+    /// the last holder of this dataset is gone.
+    #[expect(
+        dead_code,
+        reason = "held only for its Drop, which returns the dataset's bytes to the budget"
+    )]
+    pub(crate) charge: Arc<Reservation>,
 }
 
 /// Name-keyed dataset store enforcing the fail-closed dataset limits.
@@ -79,14 +165,11 @@ impl DatasetStore {
         self.datasets.remove(name)
     }
 
-    /// Removes every dataset and returns how many were dropped and their bytes.
-    pub(crate) fn reset(&mut self) -> (usize, usize) {
+    /// Removes every dataset and returns how many were dropped.
+    pub(crate) fn reset(&mut self) -> usize {
         let dropped = self.datasets.len();
-        let bytes = self.datasets.values().fold(0_usize, |total, dataset| {
-            total.saturating_add(dataset.bytes)
-        });
         self.datasets.clear();
-        (dropped, bytes)
+        dropped
     }
 
     /// Iterates datasets in lexicographic name order.
@@ -105,7 +188,10 @@ mod tests {
         Dataset {
             batches: Vec::new(),
             total_quads,
-            bytes: 0,
+            charge: Arc::new(Reservation::new(
+                Arc::new(ByteBudget::default()),
+                DatasetLimits::default(),
+            )),
         }
     }
 
@@ -142,7 +228,7 @@ mod tests {
 
         assert!(store.remove("a").is_some());
         assert!(store.remove("a").is_none());
-        assert_eq!(store.reset().0, 1);
+        assert_eq!(store.reset(), 1);
         assert!(store.get("b").is_none());
     }
 
@@ -172,5 +258,26 @@ mod tests {
             Arc::ptr_eq(&first, &second),
             "lookups must bump Arc, not clone Dataset"
         );
+    }
+
+    #[test]
+    fn a_dropped_dataset_stays_charged_while_a_reader_holds_it() {
+        let budget = Arc::new(ByteBudget::default());
+        let limits = DatasetLimits::default();
+        let charge = Arc::new(Reservation::new(Arc::clone(&budget), limits));
+        charge.charge(100).unwrap();
+        let mut store = DatasetStore::default();
+        let dataset = Dataset {
+            batches: Vec::new(),
+            total_quads: 0,
+            charge,
+        };
+        drop(store.insert("a".to_owned(), dataset, &limits).unwrap());
+        let reader = store.get("a").unwrap();
+
+        drop(store.remove("a"));
+        assert_eq!(budget.used.load(Ordering::Acquire), 100);
+        drop(reader);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
     }
 }

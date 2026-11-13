@@ -17,8 +17,9 @@ use std::{
     panic::AssertUnwindSafe,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use arrow_array::RecordBatch;
@@ -37,12 +38,12 @@ use futures::{FutureExt, StreamExt, TryStreamExt, stream, stream::BoxStream};
 use quad_fast_core::{
     QuadError, UnsignedQuadBatch, preflight_ipc_message, quad_stream_schema, validate_contract,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
     limits::DatasetLimits,
-    store::{Dataset, DatasetStore},
+    store::{ByteBudget, Dataset, DatasetStore, Reservation},
 };
 
 /// `DoAction` type that drops one dataset named by the UTF-8 action body.
@@ -79,6 +80,12 @@ pub struct QuadFlightService {
 
 impl QuadFlightService {
     /// Creates an empty store governed by `limits`.
+    ///
+    /// Unguarded: the service itself authenticates nobody and applies no
+    /// message-size, concurrency or keepalive limits. [`crate::serve_with_verifier`]
+    /// and [`crate::serve_with_limits`] add those; mounting this service on a
+    /// custom tonic server skips them, so do that only behind equivalent
+    /// controls of your own.
     #[must_use]
     pub fn new(limits: DatasetLimits) -> Self {
         Self {
@@ -95,89 +102,57 @@ impl QuadFlightService {
     }
 }
 
-/// Bytes charged against the store-wide budget: stored plus in flight.
-#[derive(Debug, Default)]
-struct ByteBudget {
-    used: AtomicUsize,
-}
+/// Encoded `DoGet` messages buffered ahead of a reader.
+///
+/// The producer task encodes at most this many messages before the reader
+/// takes one. Small, so an unread stream pins at most this many encoded
+/// messages (each at most the encode cap) on top of HTTP/2 flow control.
+const DO_GET_BUFFERED_MESSAGES: usize = 2;
 
-impl ByteBudget {
-    /// Charges `bytes` when the total stays within `limit`.
-    fn try_charge(&self, bytes: usize, limit: usize) -> bool {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|total| *total <= limit)
-            })
-            .is_ok()
-    }
-
-    /// Returns `bytes` to the budget.
-    fn release(&self, bytes: usize) {
-        // Saturating: a release never exceeds what was charged, but an
-        // underflow here must not wrap into an exhausted budget.
-        let _ = self
-            .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                Some(used.saturating_sub(bytes))
-            });
-    }
-}
-
-/// Bytes one upload has charged; released on drop unless committed.
-#[derive(Debug)]
-struct Reservation {
-    budget: Arc<ByteBudget>,
-    limits: DatasetLimits,
-    charged: AtomicUsize,
-    committed: AtomicBool,
-}
-
-impl Reservation {
-    fn new(budget: Arc<ByteBudget>, limits: DatasetLimits) -> Self {
-        Self {
-            budget,
-            limits,
-            charged: AtomicUsize::new(0),
-            committed: AtomicBool::new(false),
+/// Streams `dataset` to one reader, holding it only while the reader reads.
+///
+/// A task encodes the batches into a small bounded channel. When the reader
+/// takes no message for `idle`, the task stops and drops its handle on the
+/// dataset, so a reader that stops reading cannot pin a dropped dataset's
+/// bytes; the reader then receives the buffered messages followed by
+/// `DEADLINE_EXCEEDED`, never a silently short stream.
+fn serve_dataset(dataset: Arc<Dataset>, idle: Duration) -> ResponseStream<FlightData> {
+    let (sender, receiver) = mpsc::channel(DO_GET_BUFFERED_MESSAGES);
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let producer_timed_out = Arc::clone(&timed_out);
+    drop(tokio::spawn(async move {
+        let batches = stream::unfold((dataset, 0_usize), |(dataset, index)| async move {
+            let batch = dataset.batches.get(index)?.as_batch().clone();
+            Some((Ok::<_, FlightError>(batch), (dataset, index + 1)))
+        });
+        let mut encoded = encode_batches(batches);
+        loop {
+            let Ok(permit) = tokio::time::timeout(idle, sender.reserve()).await else {
+                producer_timed_out.store(true, Ordering::Release);
+                return;
+            };
+            // A closed channel means the reader went away.
+            let Ok(permit) = permit else { return };
+            match encoded.next().await {
+                Some(message) => permit.send(message),
+                None => return,
+            }
         }
-    }
-
-    /// Charges one received message against the dataset and store budgets.
-    fn charge(&self, bytes: usize) -> Result<(), Status> {
-        let dataset = self.charged.load(Ordering::Acquire).saturating_add(bytes);
-        if dataset > self.limits.max_dataset_bytes {
-            return Err(Status::resource_exhausted(format!(
-                "resource_limit: dataset_bytes: observed {dataset} exceeds limit {}",
-                self.limits.max_dataset_bytes
-            )));
+    }));
+    stream::unfold(Some((receiver, timed_out)), |state| async move {
+        let (mut receiver, timed_out) = state?;
+        match receiver.recv().await {
+            Some(message) => Some((message, Some((receiver, timed_out)))),
+            None if timed_out.load(Ordering::Acquire) => Some((
+                Err(Status::deadline_exceeded(
+                    "do_get: the reader took no message within the idle timeout",
+                )),
+                None,
+            )),
+            None => None,
         }
-        if !self.budget.try_charge(bytes, self.limits.max_store_bytes) {
-            return Err(Status::resource_exhausted(format!(
-                "resource_limit: store_bytes: store would exceed its limit of {} bytes",
-                self.limits.max_store_bytes
-            )));
-        }
-        self.charged.store(dataset, Ordering::Release);
-        Ok(())
-    }
-
-    /// Bytes charged so far.
-    fn charged(&self) -> usize {
-        self.charged.load(Ordering::Acquire)
-    }
-
-    /// Keeps the charge: the bytes now belong to a stored dataset.
-    fn commit(&self) {
-        self.committed.store(true, Ordering::Release);
-    }
-}
-
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        if !self.committed.load(Ordering::Acquire) {
-            self.budget.release(self.charged.load(Ordering::Acquire));
-        }
-    }
+    })
+    .boxed()
 }
 
 /// Wraps an ingest stream with the per-message guards.
@@ -504,15 +479,10 @@ impl FlightService for QuadFlightService {
             let store = self.store.read().await;
             store.get(&name).ok_or_else(dataset_not_found)?
         };
-        let batches = stream::iter(
-            dataset
-                .batches
-                .clone()
-                .into_iter()
-                .map(UnsignedQuadBatch::into_inner)
-                .map(Ok::<_, FlightError>),
-        );
-        Ok(Response::new(encode_batches(batches)))
+        Ok(Response::new(serve_dataset(
+            dataset,
+            self.limits.idle_timeout,
+        )))
     }
 
     /// Ingests one dataset atomically after validating every batch.
@@ -568,16 +538,14 @@ impl FlightService for QuadFlightService {
         drop(decoder);
 
         let receipt = put_receipt(&name, batches.len(), total_quads);
+        // The charge moves into the dataset: a replaced or dropped dataset
+        // frees its bytes only when its last reader is gone too.
         let dataset = Dataset {
             batches,
             total_quads,
-            bytes: reservation.charged(),
+            charge: reservation,
         };
-        let replaced = self.store.write().await.insert(name, dataset, &limits)?;
-        reservation.commit();
-        if let Some(replaced) = replaced {
-            self.bytes.release(replaced.bytes);
-        }
+        drop(self.store.write().await.insert(name, dataset, &limits)?);
 
         let result = PutResult {
             app_metadata: receipt.into(),
@@ -635,18 +603,17 @@ impl FlightService for QuadFlightService {
         let body = match action.r#type.as_str() {
             ACTION_DROP_DATASET => {
                 let name = dataset_name_from_bytes(&action.body, "action body", &self.limits)?;
-                let removed = self
-                    .store
-                    .write()
-                    .await
-                    .remove(&name)
-                    .ok_or_else(dataset_not_found)?;
-                self.bytes.release(removed.bytes);
+                drop(
+                    self.store
+                        .write()
+                        .await
+                        .remove(&name)
+                        .ok_or_else(dataset_not_found)?,
+                );
                 format!("{{\"dropped\":{}}}", json_string(&name))
             }
             ACTION_RESET => {
-                let (dropped, bytes) = self.store.write().await.reset();
-                self.bytes.release(bytes);
+                let dropped = self.store.write().await.reset();
                 format!("{{\"reset\":{dropped}}}")
             }
             _ => {

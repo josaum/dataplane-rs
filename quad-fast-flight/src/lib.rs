@@ -70,6 +70,7 @@ pub use limits::{
     DEFAULT_MAX_CONCURRENT_REQUESTS_PER_CONNECTION, DEFAULT_MAX_DATASET_BYTES,
     DEFAULT_MAX_DATASETS, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_MESSAGES_PER_STREAM,
     DEFAULT_MAX_NAME_BYTES, DEFAULT_MAX_QUADS_PER_DATASET, DEFAULT_MAX_STORE_BYTES, DatasetLimits,
+    decode_limit,
 };
 pub use serve::{FlightServer, ServeError, serve, serve_with_limits, serve_with_verifier};
 pub use service::{ACTION_DROP_DATASET, ACTION_RESET, QuadFlightService};
