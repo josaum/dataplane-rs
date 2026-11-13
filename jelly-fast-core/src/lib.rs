@@ -136,6 +136,7 @@ pub use encoder::{
 };
 pub use error::{JellyError, JellyResource};
 pub use patch::{
-    DEFAULT_PATCH_ROWS_PER_FRAME, JellyPatchDecoder, JellyPatchDecoderOptions, JellyPatchEncoder,
-    JellyPatchEncoderOptions, PATCH_PROTOCOL_VERSION, PatchOp,
+    DEFAULT_MAX_PATCH_OPS_PER_FRAME, DEFAULT_PATCH_ROWS_PER_FRAME, JellyPatchDecoder,
+    JellyPatchDecoderOptions, JellyPatchEncoder, JellyPatchEncoderOptions, PATCH_PROTOCOL_VERSION,
+    PatchOp,
 };

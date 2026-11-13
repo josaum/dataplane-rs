@@ -559,9 +559,9 @@ impl TermDecoder {
                 Term::BlankNode(blank_node(label, "quoted object")?)
             }
             rdf_triple::Object::OLiteral(literal) => Term::Literal(self.decode_literal(literal)?),
-            rdf_triple::Object::OTripleTerm(nested) => {
-                Term::Triple(Box::new(self.decode_triple_term(nested, depth + 1)?))
-            }
+            rdf_triple::Object::OTripleTerm(nested) => Term::Triple(Box::new(
+                self.decode_triple_term(nested, depth.saturating_add(1))?,
+            )),
         };
         Ok(Triple::new(subject, predicate, object))
     }
@@ -599,7 +599,12 @@ impl TermDecoder {
         };
         // name_id 0: previous IRI's name_id + 1 (1 for the first IRI).
         let name_id = if iri.name_id == 0 {
-            self.last_name_id.map_or(1, |last| last + 1)
+            match self.last_name_id {
+                None => 1,
+                Some(last) => last.checked_add(1).ok_or_else(|| {
+                    JellyError::Lookup("name id delta overflows past u32::MAX".into())
+                })?,
+            }
         } else {
             iri.name_id
         };

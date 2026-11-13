@@ -15,6 +15,8 @@ pub enum JellyResource {
     DatatypeTable,
     /// RDF 1.2 triple-term nesting depth.
     QuotedDepth,
+    /// Operations decoded from one patch frame.
+    PatchOps,
 }
 
 impl JellyResource {
@@ -26,6 +28,7 @@ impl JellyResource {
             Self::NameTable => "name_table",
             Self::DatatypeTable => "datatype_table",
             Self::QuotedDepth => "quoted_depth",
+            Self::PatchOps => "patch_ops",
         }
     }
 }

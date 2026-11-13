@@ -17,6 +17,15 @@ use crate::{
     terms::{TermDecoder, blank_node},
 };
 
+/// Default most operations one patch frame may decode into: 1,024.
+///
+/// Each statement run is its own Arrow batch, and an empty batch builder
+/// reserves about 130 KiB of capacity, so this bounds one frame at roughly
+/// 130 MiB live however small its rows are. A frame of more than 1,024
+/// alternating add/delete runs (which the default encoder, at up to 8,192
+/// rows per frame, can emit for update-heavy patches) needs a larger value.
+pub const DEFAULT_MAX_PATCH_OPS_PER_FRAME: usize = 1024;
+
 /// Fail-closed configuration for [`JellyPatchDecoder`].
 ///
 /// All limits are explicit: the decoder rejects streams that declare
@@ -33,6 +42,14 @@ pub struct JellyPatchDecoderOptions {
     pub max_datatype_table_size: u32,
     /// Limits applied to every batch built from consecutive statements.
     pub quad_limits: QuadLimits,
+    /// Most operations (statement runs, transaction markers, headers) one
+    /// frame may decode into.
+    ///
+    /// Every run of add or delete rows becomes its own Arrow batch, so a
+    /// frame of alternating one-row runs (about six wire bytes each) would
+    /// otherwise materialize one batch per row: 20,000 such rows passed a
+    /// 1 GiB allocation cap. Defaults to [`DEFAULT_MAX_PATCH_OPS_PER_FRAME`].
+    pub max_ops_per_frame: usize,
 }
 
 impl Default for JellyPatchDecoderOptions {
@@ -42,6 +59,7 @@ impl Default for JellyPatchDecoderOptions {
             max_name_table_size: crate::encoder::DEFAULT_MAX_NAME_TABLE_SIZE,
             max_datatype_table_size: crate::encoder::DEFAULT_MAX_DATATYPE_TABLE_SIZE,
             quad_limits: QuadLimits::default(),
+            max_ops_per_frame: DEFAULT_MAX_PATCH_OPS_PER_FRAME,
         }
     }
 }
@@ -125,7 +143,8 @@ impl JellyPatchDecoder {
     /// triple terms outside the object position or without the `rdf_star`
     /// options flag, generalized statements, namespace rows, versions other
     /// than 1); [`JellyError::ResourceLimit`] when a declared table
-    /// exceeds a configured maximum; [`JellyError::Lookup`],
+    /// exceeds a configured maximum or the frame would decode into more
+    /// than `max_ops_per_frame` operations; [`JellyError::Lookup`],
     /// [`JellyError::Frame`], and [`JellyError::Term`] for malformed row
     /// content or ordering (including transaction and header-placement
     /// violations); and [`JellyError::Quad`] when batch construction hits
@@ -133,6 +152,8 @@ impl JellyPatchDecoder {
     pub fn decode_frame(&mut self, frame: &RdfPatchFrame) -> Result<Vec<PatchOp>, JellyError> {
         let mut ops = Vec::new();
         let mut pending: Option<PendingBatch> = None;
+        let quad_limits = self.options.quad_limits;
+        let max_ops = self.options.max_ops_per_frame;
         // The vendored schema requires header rows at the start of the
         // patch frame; options and lookup entry rows do not displace them.
         let mut non_header_row_seen = false;
@@ -151,17 +172,18 @@ impl JellyPatchDecoder {
                     let same_run = matches!(&pending, Some(batch) if batch.is_add == is_add);
                     if !same_run {
                         flush_pending(&mut pending, &mut ops)?;
-                        pending = Some(PendingBatch {
-                            is_add,
-                            builder: QuadBatchBuilder::new(self.options.quad_limits),
-                        });
+                        check_op_count(max_ops, ops.len().saturating_add(1))?;
                     }
-                    let batch = pending.as_mut().expect("pending batch ensured above");
+                    let batch = pending.get_or_insert_with(|| PendingBatch {
+                        is_add,
+                        builder: QuadBatchBuilder::new(quad_limits),
+                    });
                     batch.builder.push(quad.as_ref(), None)?;
                 }
                 rdf_patch_row::Row::TransactionStart(_) => {
                     non_header_row_seen = true;
                     flush_pending(&mut pending, &mut ops)?;
+                    check_op_count(max_ops, ops.len().saturating_add(1))?;
                     let state = self.state_mut()?;
                     if state.in_transaction {
                         return Err(JellyError::Frame(
@@ -177,6 +199,7 @@ impl JellyPatchDecoder {
                 | rdf_patch_row::Row::TransactionAbort(_) => {
                     non_header_row_seen = true;
                     flush_pending(&mut pending, &mut ops)?;
+                    check_op_count(max_ops, ops.len().saturating_add(1))?;
                     let is_commit = matches!(row, rdf_patch_row::Row::TransactionCommit(_));
                     let state = self.state_mut()?;
                     if !state.in_transaction {
@@ -198,6 +221,7 @@ impl JellyPatchDecoder {
                             "header rows must occur at the start of the patch frame".into(),
                         ));
                     }
+                    check_op_count(max_ops, ops.len().saturating_add(1))?;
                     let state = self.state_mut()?;
                     ops.push(decode_header(&mut state.terms, header)?);
                 }
@@ -375,6 +399,18 @@ impl JellyPatchDecoder {
         });
         Ok(())
     }
+}
+
+/// Refuses a frame whose operation count would exceed `max_ops`.
+fn check_op_count(max_ops: usize, count: usize) -> Result<(), JellyError> {
+    if count > max_ops {
+        return Err(JellyError::ResourceLimit {
+            resource: JellyResource::PatchOps,
+            limit: u32::try_from(max_ops).unwrap_or(u32::MAX),
+            observed: u32::try_from(count).unwrap_or(u32::MAX),
+        });
+    }
+    Ok(())
 }
 
 /// Finishes a pending statement run into an add or delete operation.

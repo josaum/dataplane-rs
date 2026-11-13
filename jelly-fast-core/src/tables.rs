@@ -169,28 +169,47 @@ impl EncoderTable {
     }
 }
 
+/// Highest identifier stored in a decoder table's dense slot vector.
+///
+/// Identifiers up to this bound live in a vector grown on demand (at most
+/// 65,536 slots, about 1.5 MiB); larger ones, which only a table configured
+/// far above the defaults (128 / 4,000 / 32) can declare, live in a map. A
+/// table therefore never allocates for identifiers that never arrive: a
+/// stream declaring `u32::MAX` slots used to reserve about 100 GB up front.
+const DENSE_SLOT_LIMIT: u32 = 1 << 16;
+
 /// Decoder-side bounded lookup table.
 ///
 /// Identifiers resolve to the value most recently assigned to them, which
 /// implements Jelly's identifier-reassignment rule for free as long as rows
-/// are processed strictly in order.
+/// are processed strictly in order. Storage grows with the entries that
+/// arrive, never with the declared capacity.
 #[derive(Debug)]
 pub(crate) struct DecoderTable {
     label: &'static str,
     capacity: u32,
-    slots: Vec<Option<String>>,
+    dense: Vec<Option<String>>,
+    sparse: HashMap<u32, String>,
     last_assigned_id: u32,
 }
 
 impl DecoderTable {
-    /// Creates an empty table sized by the stream's declared `capacity`.
+    /// Creates an empty table bounded by the stream's declared `capacity`.
     pub(crate) fn new(label: &'static str, capacity: u32) -> Self {
         Self {
             label,
             capacity,
-            slots: vec![None; capacity as usize],
+            dense: Vec::new(),
+            sparse: HashMap::new(),
             last_assigned_id: 0,
         }
+    }
+
+    fn out_of_range(&self, what: &str, id: u32) -> JellyError {
+        JellyError::Lookup(format!(
+            "{} {what} {id} is outside the declared table size {}",
+            self.label, self.capacity
+        ))
     }
 
     /// Assigns `value` to `wire_id`, applying the id-0 delta convention.
@@ -201,17 +220,25 @@ impl DecoderTable {
     /// or exceeds the declared table size.
     pub(crate) fn assign(&mut self, wire_id: u32, value: String) -> Result<(), JellyError> {
         let id = if wire_id == 0 {
-            self.last_assigned_id + 1
+            self.last_assigned_id.checked_add(1).unwrap_or(0)
         } else {
             wire_id
         };
         if id == 0 || id > self.capacity {
-            return Err(JellyError::Lookup(format!(
-                "{} entry id {id} is outside the declared table size {}",
-                self.label, self.capacity
-            )));
+            return Err(self.out_of_range("entry id", id));
         }
-        self.slots[(id - 1) as usize] = Some(value);
+        if id <= DENSE_SLOT_LIMIT {
+            let index =
+                usize::try_from(id - 1).map_err(|_overflow| self.out_of_range("entry id", id))?;
+            if self.dense.len() <= index {
+                self.dense.resize(index.saturating_add(1), None);
+            }
+            if let Some(slot) = self.dense.get_mut(index) {
+                *slot = Some(value);
+            }
+        } else {
+            self.sparse.insert(id, value);
+        }
         self.last_assigned_id = id;
         Ok(())
     }
@@ -225,12 +252,17 @@ impl DecoderTable {
     /// decoder fails closed instead of guessing).
     pub(crate) fn get(&self, id: u32) -> Result<&str, JellyError> {
         if id == 0 || id > self.capacity {
-            return Err(JellyError::Lookup(format!(
-                "{} id {id} is outside the declared table size {}",
-                self.label, self.capacity
-            )));
+            return Err(self.out_of_range("id", id));
         }
-        self.slots[(id - 1) as usize].as_deref().ok_or_else(|| {
+        let value = if id <= DENSE_SLOT_LIMIT {
+            usize::try_from(id - 1)
+                .ok()
+                .and_then(|index| self.dense.get(index))
+                .and_then(Option::as_deref)
+        } else {
+            self.sparse.get(&id).map(String::as_str)
+        };
+        value.ok_or_else(|| {
             JellyError::Lookup(format!(
                 "{} id {id} was referenced before being assigned",
                 self.label

@@ -52,6 +52,15 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+#[path = "../../tools/mutation_smoke.rs"]
+mod smoke;
+
+/// Every test in this binary runs under the shared 1 GiB live-allocation
+/// cap, so a decoder that sizes an allocation from a hostile field aborts
+/// with a message instead of exhausting the machine.
+#[global_allocator]
+static ALLOCATOR: smoke::CappedAllocator = smoke::CappedAllocator;
+
 use arrow_array::RecordBatch;
 use jelly_fast_core::{
     JellyDecoder, JellyDecoderOptions, JellyEncoder, JellyEncoderOptions, JellyError,
@@ -1177,6 +1186,7 @@ fn fuzz_patch_round_trip() {
                 max_name_table_size,
                 max_datatype_table_size,
                 quad_limits: QuadLimits::default(),
+                ..JellyPatchDecoderOptions::default()
             });
             let mut decoded = Vec::new();
             for (index, frame) in frames.iter().enumerate() {
@@ -1742,4 +1752,58 @@ fn regression_patch_lookup_reassignment_within_one_statement_is_refused() {
         .encode_ops(&[PatchOp::Add(batch)])
         .expect_err("three distinct prefixes cannot share a one-entry table");
     assert_eq!(error.code(), "resource_limit", "got {error}");
+}
+
+/// Seeds for the patch mutation smoke: encoder output for generated ops.
+fn patch_seed_corpus() -> Vec<Vec<u8>> {
+    let mut rng = Rng::new(0x5EED_0000_DA7A_0001);
+    let mut corpus = Vec::new();
+    for rdf_star in [false, true] {
+        for _ in 0..8 {
+            let ops = gen_patch_ops(&mut rng, rdf_star, usize::from(rdf_star) * 2);
+            let Ok(mut encoder) = JellyPatchEncoder::new(JellyPatchEncoderOptions {
+                rdf_star,
+                ..JellyPatchEncoderOptions::default()
+            }) else {
+                continue;
+            };
+            if let Ok(frames) = encoder.encode_ops(&ops) {
+                corpus.extend(frames.iter().map(Message::encode_to_vec));
+            }
+        }
+    }
+    corpus
+}
+
+/// Mutated encoder output through every public decode entry point
+/// (`RdfStreamFrame::decode` then `JellyDecoder::decode_frame` over a
+/// two-frame stream; `RdfPatchFrame::decode` then
+/// `JellyPatchDecoder::decode_frame` and `finish`), with bytes flipped,
+/// truncated, duplicated, and inserted, on a 256 KiB thread under the
+/// 1 GiB allocation cap: no panic, no abort.
+#[test]
+fn mutation_smoke_on_a_small_stack_under_the_allocation_cap() {
+    smoke::run_on_small_stack(|| {
+        let stream_seeds = seed_corpus();
+        let first = stream_seeds.first().cloned().unwrap_or_default();
+        smoke::assert_no_panics("jelly-stream", &stream_seeds, 10_000, |bytes| {
+            let mut decoder = JellyDecoder::new(JellyDecoderOptions::default());
+            if let Ok(frame) = RdfStreamFrame::decode(first.as_slice()) {
+                let _ = decoder.decode_frame(&frame);
+            }
+            if let Ok(frame) = RdfStreamFrame::decode(bytes) {
+                let _ = decoder.decode_frame(&frame);
+                let _ = JellyDecoder::new(JellyDecoderOptions::default()).decode_frame(&frame);
+            }
+        });
+        let patch_seeds = patch_seed_corpus();
+        assert!(!patch_seeds.is_empty(), "patch encoder produced no seeds");
+        smoke::assert_no_panics("jelly-patch", &patch_seeds, 10_000, |bytes| {
+            if let Ok(frame) = RdfPatchFrame::decode(bytes) {
+                let mut decoder = JellyPatchDecoder::new(JellyPatchDecoderOptions::default());
+                let _ = decoder.decode_frame(&frame);
+                let _ = decoder.finish();
+            }
+        });
+    });
 }
