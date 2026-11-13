@@ -952,6 +952,7 @@ name = "jelly-fast-grpc"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "flight-auth",
  "futures",
  "jelly-fast-core",
  "oxrdf",

@@ -23,6 +23,13 @@ pub enum JellyGrpcError {
     /// A publish request is structurally invalid before leaving the client.
     #[error("publish: {0}")]
     Publish(String),
+    /// A server would accept unauthenticated traffic from the network.
+    ///
+    /// Raised for an unauthenticated bind on a non-loopback address and for
+    /// a verifier that does not require authentication with an issuer and
+    /// audience.
+    #[error("auth: {0}")]
+    Auth(String),
 }
 
 impl JellyGrpcError {
@@ -34,6 +41,7 @@ impl JellyGrpcError {
             Self::Status(_) => "status",
             Self::Codec(_) => "codec",
             Self::Publish(_) => "publish",
+            Self::Auth(_) => "auth",
         }
     }
 }

@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use flight_auth::FlightRequestAuthVerifier;
 use futures::{Stream, StreamExt};
 use jelly_fast_core::proto::{
     RdfStreamFrame, RdfStreamOptions, RdfStreamReceived, RdfStreamSubscribe, rdf_stream_row,
@@ -14,11 +15,15 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::{
     BroadcastStream, TcpListenerStream, errors::BroadcastStreamRecvError,
 };
-use tonic::{Request, Response, Status, Streaming, transport::Server};
+use tonic::{Request, Response, Status, Streaming, service::interceptor::InterceptedService};
 
 use crate::{
     error::JellyGrpcError,
     registry::{TopicRegistry, check_requested_options},
+    transport::{
+        DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_PUBLISH_IDLE_TIMEOUT, auth_gate, next_message,
+        require_loopback, require_verifier, server_builder,
+    },
 };
 
 /// Pub/sub implementation of the Jelly `RdfStreamService`.
@@ -79,7 +84,7 @@ impl RdfStreamService for JellyStreamService {
         if subscribe.topic.is_empty() {
             return Err(Status::invalid_argument("topic must not be empty"));
         }
-        let (receiver, published) = self.registry.subscribe(&subscribe.topic);
+        let (receiver, published) = self.registry.subscribe(&subscribe.topic)?;
         let requested = subscribe.requested_options;
         if let (Some(requested), Some(published)) = (&requested, &published) {
             check_requested_options(requested, published).map_err(Status::invalid_argument)?;
@@ -107,29 +112,23 @@ impl RdfStreamService for JellyStreamService {
         request: Request<Streaming<RdfStreamFrame>>,
     ) -> Result<Response<RdfStreamReceived>, Status> {
         let mut frames = request.into_inner();
-        let mut sender = None;
-        while let Some(frame) = frames.message().await? {
-            if sender.is_none() {
-                let options = leading_options(&frame)?;
-                if options.stream_name.is_empty() {
-                    return Err(Status::invalid_argument(
-                        "stream options must carry a non-empty stream_name to use as the topic",
-                    ));
-                }
-                sender = Some(
-                    self.registry
-                        .register_publisher(&options.stream_name, options),
-                );
-            }
-            let sender = sender.as_ref().expect("sender set on first frame");
-            // A send error only means no subscriber is currently attached;
-            // at-most-once relay semantics are documented on TopicRegistry.
-            let _ = sender.send(Arc::new(frame));
-        }
-        if sender.is_none() {
+        let first = next_message(&mut frames, DEFAULT_PUBLISH_IDLE_TIMEOUT)
+            .await?
+            .ok_or_else(|| Status::invalid_argument("published stream contained no frames"))?;
+        let options = leading_options(&first)?;
+        if options.stream_name.is_empty() {
             return Err(Status::invalid_argument(
-                "published stream contained no frames",
+                "stream options must carry a non-empty stream_name to use as the topic",
             ));
+        }
+        let sender = self
+            .registry
+            .register_publisher(&options.stream_name, options)?;
+        // A send error only means no subscriber is currently attached;
+        // at-most-once relay semantics are documented on TopicRegistry.
+        let _ = sender.send(Arc::new(first));
+        while let Some(frame) = next_message(&mut frames, DEFAULT_PUBLISH_IDLE_TIMEOUT).await? {
+            let _ = sender.send(Arc::new(frame));
         }
         Ok(Response::new(RdfStreamReceived {}))
     }
@@ -138,7 +137,10 @@ impl RdfStreamService for JellyStreamService {
 /// A bound, not-yet-running Jelly pub/sub server.
 ///
 /// Binding is separated from serving so callers can bind port 0 and learn
-/// the assigned address before the accept loop starts.
+/// the assigned address before the accept loop starts. [`JellyServer::bind`]
+/// authenticates nothing and so binds only loopback;
+/// [`JellyServer::bind_with_verifier`] gates every RPC behind the shared
+/// `flight-auth` JWT verifier.
 ///
 /// # Examples
 ///
@@ -163,18 +165,45 @@ pub struct JellyServer {
     listener: TcpListener,
     local_addr: SocketAddr,
     registry: Arc<TopicRegistry>,
+    verifier: Option<FlightRequestAuthVerifier>,
 }
 
 impl JellyServer {
-    /// Binds a listener on `addr` for a server routed through `registry`.
+    /// Binds an unauthenticated listener on a loopback `addr`.
     ///
     /// # Errors
     ///
-    /// Returns [`JellyGrpcError::Transport`] when the socket cannot be
-    /// bound or its local address cannot be resolved.
+    /// Returns [`JellyGrpcError::Auth`] when `addr` is not loopback and
+    /// [`JellyGrpcError::Transport`] when the socket cannot be bound or its
+    /// local address cannot be resolved.
     pub async fn bind(
         addr: SocketAddr,
         registry: Arc<TopicRegistry>,
+    ) -> Result<Self, JellyGrpcError> {
+        require_loopback(addr)?;
+        Self::bind_inner(addr, registry, None).await
+    }
+
+    /// Binds a listener whose every RPC is verified by `verifier`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JellyGrpcError::Auth`] when `verifier` does not require
+    /// authentication or lacks an issuer or audience, and
+    /// [`JellyGrpcError::Transport`] when the socket cannot be bound.
+    pub async fn bind_with_verifier(
+        addr: SocketAddr,
+        registry: Arc<TopicRegistry>,
+        verifier: FlightRequestAuthVerifier,
+    ) -> Result<Self, JellyGrpcError> {
+        let verifier = require_verifier(verifier)?;
+        Self::bind_inner(addr, registry, Some(verifier)).await
+    }
+
+    async fn bind_inner(
+        addr: SocketAddr,
+        registry: Arc<TopicRegistry>,
+        verifier: Option<FlightRequestAuthVerifier>,
     ) -> Result<Self, JellyGrpcError> {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
@@ -182,6 +211,7 @@ impl JellyServer {
             listener,
             local_addr,
             registry,
+            verifier,
         })
     }
 
@@ -198,10 +228,11 @@ impl JellyServer {
     /// Returns [`JellyGrpcError::Transport`] when the tonic server stops
     /// with a transport error.
     pub async fn serve(self) -> Result<(), JellyGrpcError> {
-        Server::builder()
-            .add_service(RdfStreamServiceServer::new(JellyStreamService::new(
-                self.registry,
-            )))
+        let service = RdfStreamServiceServer::new(JellyStreamService::new(self.registry))
+            .max_decoding_message_size(DEFAULT_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(DEFAULT_MAX_MESSAGE_BYTES);
+        server_builder()
+            .add_service(InterceptedService::new(service, auth_gate(self.verifier)))
             .serve_with_incoming(TcpListenerStream::new(self.listener))
             .await?;
         Ok(())

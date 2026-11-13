@@ -12,6 +12,18 @@
 //! Everything relayed here is **unsigned by construction**: the transport
 //! moves frames and never certifies, approves, or promotes their content.
 //!
+//! # Authentication and limits
+//!
+//! `bind_with_verifier` on [`JellyServer`] and [`JellyPatchServer`] gates
+//! every RPC behind the shared `flight-auth` JWT verifier and refuses a
+//! verifier that does not require authentication with an issuer and
+//! audience; plain `bind` authenticates nothing and binds only loopback.
+//! Clients attach credentials with `connect_with_authorization`. Messages
+//! are capped at [`DEFAULT_MAX_MESSAGE_BYTES`] both ways, a publish stream
+//! idle for [`DEFAULT_PUBLISH_IDLE_TIMEOUT`] ends with `DEADLINE_EXCEEDED`,
+//! and each registry holds at most [`DEFAULT_MAX_TOPICS`] live topics whose
+//! names are at most [`MAX_TOPIC_NAME_BYTES`] bytes.
+//!
 //! The transport is codec-transparent: [`JellyClient`] passes
 //! `jelly-fast-core` encoder and decoder options straight through, so RDF
 //! 1.2 triple terms (RDF-star) cross the wire whenever the publisher sets
@@ -44,10 +56,15 @@ mod patch_client;
 mod patch_service;
 mod registry;
 mod service;
+mod transport;
 
 pub use client::{JellyClient, QuadBatchSubscription};
 pub use error::JellyGrpcError;
 pub use patch_client::{JellyPatchClient, PatchOpSubscription};
 pub use patch_service::{JellyPatchServer, JellyPatchStreamService};
-pub use registry::{DEFAULT_TOPIC_CAPACITY, PatchTopicRegistry, TopicRegistry};
+pub use registry::{
+    DEFAULT_MAX_TOPICS, DEFAULT_TOPIC_CAPACITY, MAX_TOPIC_NAME_BYTES, PatchTopicRegistry,
+    TopicRegistry,
+};
 pub use service::{JellyServer, JellyStreamService};
+pub use transport::{DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_PUBLISH_IDLE_TIMEOUT};

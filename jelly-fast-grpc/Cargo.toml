@@ -9,11 +9,13 @@ publish = false
 
 [dependencies]
 arrow-array = { workspace = true }
+flight-auth = { workspace = true }
 futures = { workspace = true }
 jelly-fast-core = { workspace = true }
 quad-fast-core = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net"] }
+# `time` bounds how long a publish stream may sit idle between messages.
+tokio = { workspace = true, features = ["net", "time"] }
 tokio-stream = { workspace = true, features = ["net", "sync"] }
 tonic = { workspace = true }
 

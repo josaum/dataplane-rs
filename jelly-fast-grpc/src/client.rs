@@ -2,6 +2,7 @@
 //! Thin client wrapper publishing and subscribing quad batches.
 
 use arrow_array::RecordBatch;
+use flight_auth::FlightAuthorizationMetadata;
 use jelly_fast_core::{
     JellyDecoder, JellyDecoderOptions, JellyEncoder, JellyEncoderOptions,
     proto::{
@@ -9,9 +10,9 @@ use jelly_fast_core::{
         rdf_stream_service_client::RdfStreamServiceClient,
     },
 };
-use tonic::{Streaming, transport::Channel};
+use tonic::{Request, Streaming, transport::Channel};
 
-use crate::error::JellyGrpcError;
+use crate::{error::JellyGrpcError, transport::DEFAULT_MAX_MESSAGE_BYTES};
 
 /// Client for publishing and subscribing `UnsignedQuadStream` batches.
 ///
@@ -22,21 +23,50 @@ use crate::error::JellyGrpcError;
 #[derive(Clone, Debug)]
 pub struct JellyClient {
     inner: RdfStreamServiceClient<Channel>,
+    authorization: Option<FlightAuthorizationMetadata>,
 }
 
 impl JellyClient {
     /// Connects to a Jelly pub/sub server at `endpoint`.
     ///
-    /// The endpoint is a full URI such as `http://127.0.0.1:50051`.
+    /// The endpoint is a full URI such as `http://127.0.0.1:50051`. Messages
+    /// are capped at [`crate::DEFAULT_MAX_MESSAGE_BYTES`] in both directions.
     ///
     /// # Errors
     ///
     /// Returns [`JellyGrpcError::Transport`] when the connection cannot be
     /// established.
     pub async fn connect(endpoint: String) -> Result<Self, JellyGrpcError> {
+        let inner = RdfStreamServiceClient::connect(endpoint)
+            .await?
+            .max_decoding_message_size(DEFAULT_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(DEFAULT_MAX_MESSAGE_BYTES);
         Ok(Self {
-            inner: RdfStreamServiceClient::connect(endpoint).await?,
+            inner,
+            authorization: None,
         })
+    }
+
+    /// Connects and attaches `authorization` to every request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JellyGrpcError::Transport`] when the connection cannot be
+    /// established.
+    pub async fn connect_with_authorization(
+        endpoint: String,
+        authorization: FlightAuthorizationMetadata,
+    ) -> Result<Self, JellyGrpcError> {
+        let mut client = Self::connect(endpoint).await?;
+        client.authorization = Some(authorization);
+        Ok(client)
+    }
+
+    fn request<T>(&self, payload: T) -> Request<T> {
+        match &self.authorization {
+            Some(authorization) => authorization.request(payload),
+            None => Request::new(payload),
+        }
     }
 
     /// Publishes `batches` as one self-contained Jelly stream on `topic`.
@@ -72,7 +102,8 @@ impl JellyClient {
         for batch in batches {
             frames.extend(encoder.encode_batch(batch)?);
         }
-        self.inner.publish_rdf(tokio_stream::iter(frames)).await?;
+        let request = self.request(tokio_stream::iter(frames));
+        self.inner.publish_rdf(request).await?;
         Ok(())
     }
 
@@ -93,13 +124,11 @@ impl JellyClient {
         requested_options: Option<RdfStreamOptions>,
         decoder_options: JellyDecoderOptions,
     ) -> Result<QuadBatchSubscription, JellyGrpcError> {
-        let response = self
-            .inner
-            .subscribe_rdf(RdfStreamSubscribe {
-                topic: topic.to_owned(),
-                requested_options,
-            })
-            .await?;
+        let request = self.request(RdfStreamSubscribe {
+            topic: topic.to_owned(),
+            requested_options,
+        });
+        let response = self.inner.subscribe_rdf(request).await?;
         Ok(QuadBatchSubscription {
             frames: response.into_inner(),
             decoder: JellyDecoder::new(decoder_options),
