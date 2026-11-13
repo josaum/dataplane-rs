@@ -1,0 +1,58 @@
+# Known advisories against the crates in Cargo.lock, from the RustSec
+# database, and the supply-chain policy in deny.toml.
+#
+# This is its own workflow, and ci.yml must never call it or run the scan
+# itself: release.yml calls ci.yml, and an advisory published against a
+# dependency must not block the release of an unrelated fix. It runs weekly
+# because an advisory arrives on the database's schedule and not on a
+# commit's, and on every push to main and every pull request.
+#
+# No advisory is ignored. A finding is answered by upgrading the dependency.
+name: audit
+
+on:
+  schedule:
+    # Mondays, 06:23 UTC.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.1
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.23.0
+      - name: Fail on a vulnerability or an unsoundness advisory
+        # A vulnerability fails the scan by default; `--deny unsound` makes an
+        # unsoundness advisory, which is otherwise only a warning, fail it too.
+        run: cargo audit --deny unsound
+
+  cargo-deny:
+    # A job of its own: a licence or source finding must report even when an
+    # advisory has already failed the scan above.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.1
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2
+      - name: Check advisories, licences, bans and sources against deny.toml
+        run: cargo deny --locked check

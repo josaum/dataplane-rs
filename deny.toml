@@ -1,0 +1,71 @@
+# Supply-chain policy for `cargo deny check`, run by audit.yml next to
+# `cargo audit`. Four questions about what Cargo.lock resolves: is there a
+# known advisory, is every licence one this project can ship under, is a crate
+# banned or duplicated, and does everything come from crates.io.
+#
+# Every setting is as strict as the lockfile passes today. Where it is weaker
+# than "deny", the comment beside it says what stops it.
+
+[graph]
+# Optional features are part of what a consumer can build, so their
+# dependencies are judged too.
+all-features = true
+
+[advisories]
+# No advisory is ignored. A finding is answered by upgrading the dependency.
+# A vulnerability, an unsound crate and an unmaintained crate all fail.
+ignore = []
+# A version withdrawn from crates.io by its author fails as well.
+yanked = "deny"
+# An unmaintained crate fails wherever it sits in the graph, not only as a
+# direct dependency.
+unmaintained = "all"
+
+[licenses]
+# The workspace is distributed as MIT. A dependency passes when its licence
+# expression can be satisfied from this list alone; where a crate offers a
+# choice (`MIT OR Apache-2.0`, `Unlicense OR MIT`, `Apache-2.0 OR BSL-1.0`,
+# `MIT OR Apache-2.0 OR LGPL-2.1-or-later`), the listed alternative is the
+# one taken. Nothing here is copyleft over the combined work.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  # Apache-2.0 plus a linking exception that only adds permissions
+  # (linux-raw-sys, rustix, target-lexicon, wasi).
+  "Apache-2.0 WITH LLVM-exception",
+  # Permissive, attribution only: zerocopy (BSD-2-Clause); encoding_rs,
+  # matchit, zstd-safe, zstd-sys (BSD-3-Clause); libloading, ring,
+  # simple_asn1, untrusted (ISC); foldhash (Zlib).
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  # A public-domain dedication: tiny-keccak.
+  "CC0-1.0",
+  # The Unicode data tables inside unicode-ident. Permissive, notice required.
+  "Unicode-3.0",
+]
+# How sure the licence-text matcher must be before it names a licence.
+confidence-threshold = 0.93
+
+[bans]
+# Two versions of one crate in the lockfile. This cannot be "deny" today:
+# each duplicate is pulled in by a dependency's own dependency and goes away
+# only when that dependency moves (foldhash 0.1 and 0.2, r-efi 5 and 6, among
+# others; `cargo deny check bans` lists them). Raise this to "deny" with a
+# `skip` entry per unavoidable crate once the list is short enough to keep by
+# hand.
+multiple-versions = "warn"
+# A dependency with no version requirement. The binding and Flight crates
+# name their sibling core crates by path alone, which cargo-deny counts as a
+# wildcard; `allow-wildcard-paths` accepts exactly those because every member
+# is `publish = false`. A crates.io dependency without a version still fails.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Everything comes from crates.io: no other registry and no git dependency.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,0 +1,56 @@
+# Weekly dependency updates, one entry per ecosystem with a manifest in the
+# repository. For cargo, minor and patch updates arrive together and each
+# major arrives in a pull request of its own, so it can be judged on its own.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    # The workspace root: one Cargo.lock resolves every member crate.
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      cargo-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+      # The Arrow crates share one exact version, so a new major moves all of
+      # them in one pull request.
+      arrow-major:
+        patterns:
+          - "arrow"
+          - "arrow-*"
+        update-types:
+          - major
+
+  - package-ecosystem: github-actions
+    # Every action is pinned by commit SHA with its version in a trailing
+    # comment; Dependabot moves both.
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+      include: scope
+
+  - package-ecosystem: pip
+    # quad-fast-py's pyproject.toml: the pyarrow floor and the test group.
+    directory: /quad-fast-py
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+
+  - package-ecosystem: npm
+    # quad-fast-node's package.json.
+    directory: /quad-fast-node
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
