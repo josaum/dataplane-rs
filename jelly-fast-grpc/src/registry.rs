@@ -2,13 +2,14 @@
 //! Bounded topic registries backed by tokio broadcast channels.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use jelly_fast_core::proto::{
     RdfStreamFrame, RdfStreamOptions,
     patch::{RdfPatchFrame, RdfPatchOptions},
 };
 use tokio::sync::broadcast;
+use tonic::Status;
 
 /// Default per-topic broadcast capacity, in frames.
 ///
@@ -18,6 +19,21 @@ use tokio::sync::broadcast;
 /// explicit `DATA_LOSS` status instead of silently missing frames;
 /// raising the bound trades memory for slow-subscriber tolerance.
 pub const DEFAULT_TOPIC_CAPACITY: usize = 256;
+
+/// Default maximum number of live topics in one registry.
+///
+/// Every new topic name allocates a broadcast channel, and topics used to be
+/// kept forever, so a client could grow the registry without bound by
+/// subscribing to fresh names. At the limit, topics with neither a subscriber
+/// nor a publisher are pruned first; only then is a new name refused with
+/// `RESOURCE_EXHAUSTED`.
+pub const DEFAULT_MAX_TOPICS: usize = 1_024;
+
+/// Maximum topic name length, in bytes.
+///
+/// Topic names are map keys held for the life of the topic; nothing
+/// legitimate needs more.
+pub const MAX_TOPIC_NAME_BYTES: usize = 256;
 
 /// One pub/sub topic: its broadcast channel and last announced options.
 ///
@@ -40,38 +56,82 @@ struct Topic<F, O> {
 #[derive(Debug)]
 struct Topics<F, O> {
     capacity: usize,
+    max_topics: usize,
     topics: Mutex<HashMap<String, Topic<F, O>>>,
 }
 
 impl<F: Clone, O: Clone> Topics<F, O> {
     /// Creates a table whose topics buffer at most `capacity` frames.
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, max_topics: usize) -> Self {
         assert!(capacity > 0, "topic capacity must be nonzero");
         Self {
             capacity,
+            max_topics,
             topics: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Registers a publisher, storing `options` as the topic's contract.
-    fn register_publisher(&self, topic: &str, options: &O) -> broadcast::Sender<Arc<F>> {
-        let mut topics = self.topics.lock().expect("topic registry lock poisoned");
-        let topic = topics.entry(topic.to_owned()).or_insert_with(|| Topic {
+    /// Locks the table, recovering it after a panic in another holder.
+    ///
+    /// Every critical section is a single map operation, so a poisoned lock
+    /// still guards a consistent map; refusing it would turn one panic into
+    /// a permanent outage of every later RPC.
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Topic<F, O>>> {
+        self.topics.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Returns the topic named `name`, creating it within the limits.
+    fn topic<'t>(
+        &self,
+        topics: &'t mut HashMap<String, Topic<F, O>>,
+        name: &str,
+    ) -> Result<&'t mut Topic<F, O>, Status> {
+        if name.len() > MAX_TOPIC_NAME_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "topic name exceeds {MAX_TOPIC_NAME_BYTES} bytes"
+            )));
+        }
+        if !topics.contains_key(name) && topics.len() >= self.max_topics {
+            // A topic nobody holds a sender or receiver for is dead: the
+            // registry's own sender is the only strong reference left.
+            topics.retain(|_, topic| {
+                topic.sender.receiver_count() > 0 || topic.sender.strong_count() > 1
+            });
+            if topics.len() >= self.max_topics {
+                return Err(Status::resource_exhausted(format!(
+                    "resource_limit: topics: registry already holds the maximum of {} live topics",
+                    self.max_topics
+                )));
+            }
+        }
+        Ok(topics.entry(name.to_owned()).or_insert_with(|| Topic {
             sender: broadcast::channel(self.capacity).0,
             options: None,
-        });
+        }))
+    }
+
+    /// Registers a publisher, storing `options` as the topic's contract.
+    fn register_publisher(
+        &self,
+        topic: &str,
+        options: &O,
+    ) -> Result<broadcast::Sender<Arc<F>>, Status> {
+        let mut topics = self.lock();
+        let topic = self.topic(&mut topics, topic)?;
         topic.options = Some(options.clone());
-        topic.sender.clone()
+        Ok(topic.sender.clone())
     }
 
     /// Subscribes to `topic`, creating it when absent.
-    fn subscribe(&self, topic: &str) -> (broadcast::Receiver<Arc<F>>, Option<O>) {
-        let mut topics = self.topics.lock().expect("topic registry lock poisoned");
-        let topic = topics.entry(topic.to_owned()).or_insert_with(|| Topic {
-            sender: broadcast::channel(self.capacity).0,
-            options: None,
-        });
-        (topic.sender.subscribe(), topic.options.clone())
+    fn subscribe(&self, topic: &str) -> Result<(broadcast::Receiver<Arc<F>>, Option<O>), Status> {
+        let mut topics = self.lock();
+        let topic = self.topic(&mut topics, topic)?;
+        Ok((topic.sender.subscribe(), topic.options.clone()))
+    }
+
+    /// Number of topics currently held, live or not yet pruned.
+    fn len(&self) -> usize {
+        self.lock().len()
     }
 }
 
@@ -97,9 +157,25 @@ impl TopicRegistry {
     /// nonzero capacity, and a zero bound would make every topic useless.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        Self::with_max_topics(capacity, DEFAULT_MAX_TOPICS)
+    }
+
+    /// Creates a registry holding at most `max_topics` live topics.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `capacity` is zero, as [`TopicRegistry::new`] does.
+    #[must_use]
+    pub fn with_max_topics(capacity: usize, max_topics: usize) -> Self {
         Self {
-            topics: Topics::new(capacity),
+            topics: Topics::new(capacity, max_topics),
         }
+    }
+
+    /// Number of topics currently held, live or not yet pruned.
+    #[must_use]
+    pub fn topic_count(&self) -> usize {
+        self.topics.len()
     }
 
     /// Registers a publisher, storing `options` as the topic's contract.
@@ -110,7 +186,7 @@ impl TopicRegistry {
         &self,
         topic: &str,
         options: &RdfStreamOptions,
-    ) -> broadcast::Sender<Arc<RdfStreamFrame>> {
+    ) -> Result<broadcast::Sender<Arc<RdfStreamFrame>>, Status> {
         self.topics.register_publisher(topic, options)
     }
 
@@ -122,10 +198,13 @@ impl TopicRegistry {
     pub(crate) fn subscribe(
         &self,
         topic: &str,
-    ) -> (
-        broadcast::Receiver<Arc<RdfStreamFrame>>,
-        Option<RdfStreamOptions>,
-    ) {
+    ) -> Result<
+        (
+            broadcast::Receiver<Arc<RdfStreamFrame>>,
+            Option<RdfStreamOptions>,
+        ),
+        Status,
+    > {
         self.topics.subscribe(topic)
     }
 }
@@ -155,9 +234,25 @@ impl PatchTopicRegistry {
     /// nonzero capacity, and a zero bound would make every topic useless.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        Self::with_max_topics(capacity, DEFAULT_MAX_TOPICS)
+    }
+
+    /// Creates a registry holding at most `max_topics` live topics.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `capacity` is zero, as [`PatchTopicRegistry::new`] does.
+    #[must_use]
+    pub fn with_max_topics(capacity: usize, max_topics: usize) -> Self {
         Self {
-            topics: Topics::new(capacity),
+            topics: Topics::new(capacity, max_topics),
         }
+    }
+
+    /// Number of topics currently held, live or not yet pruned.
+    #[must_use]
+    pub fn topic_count(&self) -> usize {
+        self.topics.len()
     }
 
     /// Registers a publisher, storing `options` as the topic's contract.
@@ -165,7 +260,7 @@ impl PatchTopicRegistry {
         &self,
         topic: &str,
         options: &RdfPatchOptions,
-    ) -> broadcast::Sender<Arc<RdfPatchFrame>> {
+    ) -> Result<broadcast::Sender<Arc<RdfPatchFrame>>, Status> {
         self.topics.register_publisher(topic, options)
     }
 
@@ -173,10 +268,13 @@ impl PatchTopicRegistry {
     pub(crate) fn subscribe(
         &self,
         topic: &str,
-    ) -> (
-        broadcast::Receiver<Arc<RdfPatchFrame>>,
-        Option<RdfPatchOptions>,
-    ) {
+    ) -> Result<
+        (
+            broadcast::Receiver<Arc<RdfPatchFrame>>,
+            Option<RdfPatchOptions>,
+        ),
+        Status,
+    > {
         self.topics.subscribe(topic)
     }
 }
@@ -341,9 +439,9 @@ mod tests {
     fn broadcast_shares_one_frame_allocation() {
         let registry = TopicRegistry::default();
         let options = RdfStreamOptions::default();
-        let sender = registry.register_publisher("t", &options);
-        let (mut first, _) = registry.subscribe("t");
-        let (mut second, _) = registry.subscribe("t");
+        let sender = registry.register_publisher("t", &options).unwrap();
+        let (mut first, _) = registry.subscribe("t").unwrap();
+        let (mut second, _) = registry.subscribe("t").unwrap();
         let frame = Arc::new(RdfStreamFrame::default());
         sender.send(Arc::clone(&frame)).expect("live subscribers");
         let got_first = first.try_recv().expect("first subscriber");
@@ -352,5 +450,43 @@ mod tests {
             Arc::ptr_eq(&got_first, &got_second) && Arc::ptr_eq(&got_first, &frame),
             "fan-out must bump Arc, not clone the prost frame"
         );
+    }
+
+    #[test]
+    fn fresh_topic_names_cannot_grow_the_registry_without_bound() {
+        let registry = TopicRegistry::with_max_topics(4, 8);
+        let mut held = Vec::new();
+        for index in 0..8 {
+            held.push(registry.subscribe(&format!("live-{index}")).unwrap());
+        }
+        let refused = registry.subscribe("one-too-many").unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
+
+        // Dropped subscriptions leave dead topics, which are pruned first.
+        held.clear();
+        for index in 0..1_000 {
+            drop(registry.subscribe(&format!("churn-{index}")).unwrap());
+        }
+        assert!(registry.topic_count() <= 8);
+
+        let oversized = "t".repeat(MAX_TOPIC_NAME_BYTES + 1);
+        assert_eq!(
+            registry.subscribe(&oversized).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn a_topic_with_a_live_publisher_is_never_pruned() {
+        let registry = TopicRegistry::with_max_topics(4, 1);
+        let sender = registry
+            .register_publisher("busy", &RdfStreamOptions::default())
+            .unwrap();
+        assert_eq!(
+            registry.subscribe("other").unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
+        drop(sender);
+        assert!(registry.subscribe("other").is_ok());
     }
 }

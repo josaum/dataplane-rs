@@ -2,6 +2,7 @@
 // Rust guideline compliant 2026-02-21
 //! Thin client wrapper publishing and subscribing patch operations.
 
+use flight_auth::FlightAuthorizationMetadata;
 use jelly_fast_core::{
     JellyPatchDecoder, JellyPatchDecoderOptions, JellyPatchEncoder, JellyPatchEncoderOptions,
     PatchOp,
@@ -12,9 +13,9 @@ use jelly_fast_core::{
         },
     },
 };
-use tonic::{Streaming, transport::Channel};
+use tonic::{Request, Streaming, transport::Channel};
 
-use crate::error::JellyGrpcError;
+use crate::{error::JellyGrpcError, transport::DEFAULT_MAX_MESSAGE_BYTES};
 
 /// Client for publishing and subscribing [`PatchOp`] sequences.
 ///
@@ -26,21 +27,50 @@ use crate::error::JellyGrpcError;
 #[derive(Clone, Debug)]
 pub struct JellyPatchClient {
     inner: PatchStreamServiceClient<Channel>,
+    authorization: Option<FlightAuthorizationMetadata>,
 }
 
 impl JellyPatchClient {
     /// Connects to a Jelly patch pub/sub server at `endpoint`.
     ///
-    /// The endpoint is a full URI such as `http://127.0.0.1:50051`.
+    /// The endpoint is a full URI such as `http://127.0.0.1:50051`. Messages
+    /// are capped at [`crate::DEFAULT_MAX_MESSAGE_BYTES`] in both directions.
     ///
     /// # Errors
     ///
     /// Returns [`JellyGrpcError::Transport`] when the connection cannot be
     /// established.
     pub async fn connect(endpoint: String) -> Result<Self, JellyGrpcError> {
+        let inner = PatchStreamServiceClient::connect(endpoint)
+            .await?
+            .max_decoding_message_size(DEFAULT_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(DEFAULT_MAX_MESSAGE_BYTES);
         Ok(Self {
-            inner: PatchStreamServiceClient::connect(endpoint).await?,
+            inner,
+            authorization: None,
         })
+    }
+
+    /// Connects and attaches `authorization` to every request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JellyGrpcError::Transport`] when the connection cannot be
+    /// established.
+    pub async fn connect_with_authorization(
+        endpoint: String,
+        authorization: FlightAuthorizationMetadata,
+    ) -> Result<Self, JellyGrpcError> {
+        let mut client = Self::connect(endpoint).await?;
+        client.authorization = Some(authorization);
+        Ok(client)
+    }
+
+    fn request<T>(&self, payload: T) -> Request<T> {
+        match &self.authorization {
+            Some(authorization) => authorization.request(payload),
+            None => Request::new(payload),
+        }
     }
 
     /// Publishes `ops` as one self-contained patch stream on `topic`.
@@ -85,9 +115,8 @@ impl JellyPatchClient {
                 frame: Some(frame),
             })
             .collect();
-        self.inner
-            .publish_patches(tokio_stream::iter(messages))
-            .await?;
+        let request = self.request(tokio_stream::iter(messages));
+        self.inner.publish_patches(request).await?;
         Ok(())
     }
 
@@ -108,13 +137,11 @@ impl JellyPatchClient {
         requested_options: Option<RdfPatchOptions>,
         decoder_options: JellyPatchDecoderOptions,
     ) -> Result<PatchOpSubscription, JellyGrpcError> {
-        let response = self
-            .inner
-            .subscribe_patches(PatchSubscribe {
-                topic: topic.to_owned(),
-                requested_options,
-            })
-            .await?;
+        let request = self.request(PatchSubscribe {
+            topic: topic.to_owned(),
+            requested_options,
+        });
+        let response = self.inner.subscribe_patches(request).await?;
         Ok(PatchOpSubscription {
             frames: response.into_inner(),
             decoder: JellyPatchDecoder::new(decoder_options),

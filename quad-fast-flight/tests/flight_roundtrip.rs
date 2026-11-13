@@ -341,6 +341,7 @@ async fn dataset_limits_fail_closed_with_resource_exhausted() {
         max_datasets: 1,
         max_batches_per_dataset: 8,
         max_quads_per_dataset: 4,
+        ..DatasetLimits::default()
     };
     let (server, mut client) = start(Some(limits)).await;
 

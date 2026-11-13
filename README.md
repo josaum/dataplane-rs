@@ -36,6 +36,14 @@ Every repository in the sovereign workspace ecosystem lives under `https://githu
 
 The Flight server reads `FLIGHT_REQUIRE_AUTH`, `FLIGHT_ALLOW_LEGACY_HS256`, `FLIGHT_JWT_PUBLIC_KEY_PEM`, `FLIGHT_JWT_PUBLIC_KEY_PATH`, `FLIGHT_JWT_ISSUER`, `FLIGHT_JWT_AUDIENCE` and `JWT_SECRET`; clients read `FLIGHT_AUTHORIZATION` or `FLIGHT_BEARER_TOKEN`. These replace the earlier `ATLAS_*` names. A server that still finds one of the old server-side names set refuses to start and names its replacement, so an upgraded deployment can never come up with authentication silently off.
 
+### Network security: what the servers do and do not do
+
+- **Plaintext transport.** The Flight and Jelly servers speak HTTP/2 without TLS (tonic with no TLS feature). Bearer tokens and data cross the wire in the clear: run them behind a TLS-terminating proxy or a service mesh.
+- **Authentication only on the provided entry points.** `serve_with_verifier` and `bind_with_verifier` gate every RPC and refuse to start unless the verifier requires authentication with an issuer and audience; `serve`, `serve_with_limits` and `bind` authenticate nothing and bind only loopback. `QuadFlightService::new`, `JellyStreamService::new` and `JellyPatchStreamService::new` are public and unguarded: mounting them on your own tonic server skips authentication, the loopback rule, the message caps and every connection limit.
+- **No tenant scoping.** Any token carrying `flight:invoke` can read, drop or `reset` any dataset and publish or subscribe to any Jelly topic, whatever its `tenant_id`.
+- **Tokens are checked when a stream opens.** An open `DoGet`, `DoExchange`, subscription or publish stream outlives its token's expiry.
+- **The Flight store budget counts encoded wire bytes** (`FlightData` header plus body as received, plus the uncompressed size any zstd buffer declares), not decoded Arrow memory. lz4-compressed ingest is refused. A dataset stays charged until its last `DoGet` reader is gone; a reader that takes no message for `idle_timeout` is cut off with `DEADLINE_EXCEEDED`.
+
 ---
 
 ## Release Matrix & Provenance (8 Artifacts)

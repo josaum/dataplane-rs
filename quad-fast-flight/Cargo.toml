@@ -9,8 +9,9 @@ license = "MIT"
 publish = false
 
 [features]
-# Wires the shared `flight-auth` JWT verifier into `serve_with_verifier`.
-auth = ["dep:flight-auth"]
+# Kept so existing `features = ["auth"]` consumers still resolve: the shared
+# `flight-auth` verifier and `serve_with_verifier` are now always built.
+auth = []
 
 [dependencies]
 arrow-array = { workspace = true }
@@ -23,11 +24,11 @@ quad-fast-core = { workspace = true }
 thiserror = { workspace = true }
 # `net` is additive on top of the workspace feature set; it is required for
 # binding the Flight listener (`TcpListener` / `TcpListenerStream`).
-tokio = { workspace = true, features = ["net"] }
+# `time` bounds how long an ingest stream may sit idle between messages.
+tokio = { workspace = true, features = ["net", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true }
-
-flight-auth = { workspace = true, optional = true }
+flight-auth = { workspace = true }
 
 [dev-dependencies]
 oxrdf = { workspace = true }

@@ -1,5 +1,7 @@
 // Rust guideline compliant 2026-02-21
-//! Fail-closed limits for the in-memory quad-dataset store.
+//! Fail-closed limits for the in-memory quad-dataset store and its transport.
+
+use std::time::Duration;
 
 /// Default maximum number of datasets held by one service.
 ///
@@ -22,11 +24,91 @@ pub const DEFAULT_MAX_BATCHES_PER_DATASET: usize = 4_096;
 /// ratio a single `DoPut` can reach before failing closed.
 pub const DEFAULT_MAX_QUADS_PER_DATASET: u64 = 16 * 1_048_576;
 
-/// Fail-closed limits governing the quad-dataset store.
+/// Default maximum decoded Arrow memory of one dataset: 1 GiB.
 ///
-/// Every limit is enforced on ingest (`DoPut`) and on the `DoExchange`
-/// transform hook; exceeding any of them rejects the request with
-/// `RESOURCE_EXHAUSTED` and leaves the store unchanged.
+/// Quad and batch counts do not bound bytes: one row may carry a
+/// multi-megabyte literal, so 4 096 batches at the message limit reach
+/// 16 GiB. 1 GiB holds a full `DEFAULT_MAX_QUADS_PER_DATASET` dataset at
+/// 64 bytes of Arrow memory per quad, which dictionary encoding keeps typical
+/// quads under.
+pub const DEFAULT_MAX_DATASET_BYTES: usize = 1 << 30;
+
+/// Default maximum decoded Arrow memory across the whole store: 4 GiB.
+///
+/// Counts stored datasets *and* uploads still in flight, so concurrent
+/// `DoPut`s cannot each buffer a full dataset before the store-wide check.
+/// Four default-sized datasets; size it to the process memory envelope.
+pub const DEFAULT_MAX_STORE_BYTES: usize = 4 << 30;
+
+/// Default maximum `FlightData` messages in one `DoPut` or `DoExchange`.
+///
+/// Dictionary and schema messages are not record batches, so the batch limit
+/// alone does not bound them. A contract batch sent with
+/// `DictionaryHandling::Resend` is one record batch plus one dictionary batch
+/// per dictionary column (nine), so this admits a full
+/// `DEFAULT_MAX_BATCHES_PER_DATASET` upload with room to spare.
+pub const DEFAULT_MAX_MESSAGES_PER_STREAM: usize = 65_536;
+
+/// Default maximum encoded gRPC message the server sends: 4 MiB.
+///
+/// tonic's own decoding default, so a default client can read everything the
+/// server sends (tonic's encoding default is unbounded). The server *accepts*
+/// slightly less: see [`decode_limit`]. The Flight encoder splits batches by
+/// rows only, so a single large row is re-encoded whole; re-encoding also
+/// changes buffer alignment (a client may write 8-byte alignment, the server
+/// writes 64-byte), so a re-encoded message can be a few KiB larger than the
+/// one received.
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Most headroom kept between the decode and encode limits: 64 KiB.
+///
+/// Re-encoding at 64-byte alignment adds at most 56 bytes of padding per
+/// buffer; a contract batch has about 30 buffers, so under 2 KiB, plus a
+/// rewritten flatbuffer header. 64 KiB leaves a wide margin.
+const MAX_REENCODE_HEADROOM: usize = 64 * 1024;
+
+/// Largest gRPC message the server accepts for a given send limit.
+///
+/// `max_message_bytes` minus a headroom of 64 KiB (or a sixteenth of the
+/// limit, if smaller), so that anything `DoPut` accepts can be re-encoded
+/// for `DoGet` and `DoExchange` within `max_message_bytes`.
+#[must_use]
+pub const fn decode_limit(max_message_bytes: usize) -> usize {
+    let sixteenth = max_message_bytes / 16;
+    let headroom = if sixteenth < MAX_REENCODE_HEADROOM {
+        sixteenth
+    } else {
+        MAX_REENCODE_HEADROOM
+    };
+    max_message_bytes - headroom
+}
+
+/// Default maximum dataset name length, in bytes.
+///
+/// Names are map keys and appear in `ListFlights`; nothing legitimate needs
+/// more, and an unbounded name is an unbounded allocation per dataset.
+pub const DEFAULT_MAX_NAME_BYTES: usize = 256;
+
+/// Default longest wait for the next message of an ingest stream: 30 s.
+///
+/// A client that opens `DoPut` or `DoExchange` and then goes quiet holds its
+/// reservation of store memory; this releases it. Raise it for producers that
+/// legitimately pause between batches.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default concurrent requests served on one connection.
+///
+/// Bounds how much work a single client can start at once; tonic's own
+/// default is unbounded.
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 32;
+
+/// Fail-closed limits governing the quad-dataset store and its transport.
+///
+/// Every limit is enforced on ingest (`DoPut`) and, where it applies, on the
+/// `DoExchange` transform hook; exceeding any of them rejects the request
+/// with `RESOURCE_EXHAUSTED` (or `DEADLINE_EXCEEDED` for the idle timeout)
+/// and leaves the store unchanged. The message-size and concurrency limits
+/// apply to every RPC.
 #[derive(Clone, Copy, Debug)]
 pub struct DatasetLimits {
     /// Maximum datasets held by the store at once.
@@ -35,6 +117,21 @@ pub struct DatasetLimits {
     pub max_batches_per_dataset: usize,
     /// Maximum total quads accepted into one dataset.
     pub max_quads_per_dataset: u64,
+    /// Maximum decoded Arrow memory of one dataset, in bytes.
+    pub max_dataset_bytes: usize,
+    /// Maximum decoded Arrow memory of all stored and in-flight datasets.
+    pub max_store_bytes: usize,
+    /// Maximum `FlightData` messages in one ingest stream.
+    pub max_messages_per_stream: usize,
+    /// Maximum encoded gRPC message the server sends; it accepts
+    /// [`decode_limit`] of this, so every accepted message fits on the way out.
+    pub max_message_bytes: usize,
+    /// Maximum dataset name length, in bytes.
+    pub max_name_bytes: usize,
+    /// Longest wait for the next message of an ingest stream.
+    pub idle_timeout: Duration,
+    /// Maximum concurrent requests on one connection.
+    pub max_concurrent_requests_per_connection: usize,
 }
 
 impl Default for DatasetLimits {
@@ -43,6 +140,13 @@ impl Default for DatasetLimits {
             max_datasets: DEFAULT_MAX_DATASETS,
             max_batches_per_dataset: DEFAULT_MAX_BATCHES_PER_DATASET,
             max_quads_per_dataset: DEFAULT_MAX_QUADS_PER_DATASET,
+            max_dataset_bytes: DEFAULT_MAX_DATASET_BYTES,
+            max_store_bytes: DEFAULT_MAX_STORE_BYTES,
+            max_messages_per_stream: DEFAULT_MAX_MESSAGES_PER_STREAM,
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+            max_name_bytes: DEFAULT_MAX_NAME_BYTES,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            max_concurrent_requests_per_connection: DEFAULT_MAX_CONCURRENT_REQUESTS_PER_CONNECTION,
         }
     }
 }

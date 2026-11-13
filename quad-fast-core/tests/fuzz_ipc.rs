@@ -797,3 +797,100 @@ fn valid_stream_shapes_still_read() {
         "the row decoders disagree with the batch row counts"
     );
 }
+
+// --- dictionary deltas ----------------------------------------------------
+
+/// A stream whose later dictionaries are deltas is refused.
+///
+/// Arrow re-concatenates the whole dictionary on every delta, so a payload of
+/// many tiny deltas costs quadratic copying. No writer in the workspace emits
+/// deltas, so refusing them narrows nothing a producer here relies on.
+#[test]
+fn delta_dictionary_streams_are_refused() {
+    silence_arrow_panics();
+    let mut rng = Rng::new(MASTER_SEED ^ 0xDE17A);
+    let (first, accepted) = random_batch(&mut rng, 5);
+    // The second batch repeats the first one's quads before adding more, so
+    // each dictionary of the second extends the first's and is sent as a delta.
+    let mut builder = QuadBatchBuilder::new(QuadLimits::default());
+    for (quad, provenance) in &accepted {
+        builder
+            .push(quad.as_ref(), provenance.as_ref())
+            .expect("replay");
+    }
+    for _ in 0..5 {
+        let quad = random_quad(&mut rng, 1);
+        drop(builder.push(quad.as_ref(), None));
+    }
+    let second = builder.finish().expect("second batch");
+    let options = arrow_ipc::writer::IpcWriteOptions::default()
+        .with_dictionary_handling(arrow_ipc::writer::DictionaryHandling::Delta);
+    let schema = quad_stream_schema();
+    let mut writer =
+        StreamWriter::try_new_with_options(Vec::new(), schema.as_ref(), options).expect("writer");
+    writer.write(&first).expect("first batch");
+    writer.write(&second).expect("second batch");
+    writer.finish().expect("finish");
+    let bytes = writer.into_inner().expect("bytes");
+
+    let error = read_ipc_stream(&bytes).expect_err("a delta-dictionary stream must be refused");
+    assert!(
+        error.to_string().contains("delta"),
+        "refusal must name the delta: {error}"
+    );
+}
+
+// --- per-message pre-flight ----------------------------------------------
+
+/// Splits a self-written stream into its `(metadata, body)` messages.
+fn messages_of(stream: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut messages = Vec::new();
+    let mut offset = 0;
+    while offset + 8 <= stream.len() {
+        let metadata_len =
+            u32::from_le_bytes(stream[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        if metadata_len == 0 {
+            break;
+        }
+        let metadata = &stream[offset + 8..offset + 8 + metadata_len];
+        let body_len = usize::try_from(
+            arrow_ipc::root_as_message(metadata)
+                .expect("self-written metadata")
+                .bodyLength(),
+        )
+        .unwrap();
+        let body_start = offset + 8 + metadata_len;
+        messages.push((
+            metadata.to_vec(),
+            stream[body_start..body_start + body_len].to_vec(),
+        ));
+        offset = body_start + body_len;
+    }
+    messages
+}
+
+/// The pre-flight itself refuses a buffer outside its body.
+///
+/// Checked on `preflight_ipc_message` directly, not through `read_ipc_stream`,
+/// so the panic barrier behind it cannot mask a weakened bounds check.
+#[test]
+fn preflight_refuses_every_buffer_that_ends_past_the_body() {
+    let mut rng = Rng::new(MASTER_SEED ^ 0xB0D1);
+    let stream = valid_stream(&mut rng, 6);
+    let mut checked = 0;
+    for (metadata, body) in messages_of(&stream) {
+        quad_fast_core::preflight_ipc_message(&metadata, &body).expect("intact message");
+        if body.is_empty() {
+            continue;
+        }
+        // Header intact, body gone: every non-empty buffer now ends past it.
+        let error = quad_fast_core::preflight_ipc_message(&metadata, &[])
+            .expect_err("a header whose body is missing must be refused");
+        assert!(
+            error.to_string().contains("declares a buffer outside its"),
+            "refusal must come from the bounds check: {error}"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 2, "the stream must carry data-bearing messages");
+}
