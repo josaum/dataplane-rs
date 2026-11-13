@@ -29,6 +29,11 @@
 //! keys. Non-shortest-form integer heads are accepted on decode so payloads
 //! from encoders that do not apply preferred serialization still parse.
 //! Half- and single-precision floats are accepted and widened to `f64`.
+//!
+//! The reader is iterative: nesting lives in a heap-allocated frame stack
+//! bounded by `max_depth`, so its stack use does not grow with input depth
+//! (a recursive reader overflowed a 256 KiB debug-build thread below the
+//! default depth of 64).
 
 use crate::error::{CborldError, CborldResource};
 
@@ -36,7 +41,30 @@ use crate::error::{CborldError, CborldResource};
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Default maximum nesting depth for CBOR items and JSON values.
+///
+/// Measured stack at this depth for the deepest documents `compress`
+/// accepts (macOS arm64): about 180 KiB unoptimized and 36 KiB optimized
+/// for `decompress`, about 116 KiB unoptimized for `compress`. Windows x64
+/// unoptimized frames run up to about twice as large, so a debug build on
+/// Windows needs roughly 370 KiB; run the codec on a thread with at least
+/// 512 KiB of stack in unoptimized builds.
 pub const DEFAULT_MAX_DEPTH: usize = 64;
+
+/// Hard ceiling on nesting depth, whatever [`CborLimits::max_depth`] says.
+///
+/// The CBOR reader is iterative, but the CBOR-LD codec layer recurses once
+/// per nesting level, so the depth budget is also a stack budget: a caller
+/// who set `max_depth` to `usize::MAX` could otherwise overflow any stack.
+/// Larger settings are clamped to this value (see
+/// [`CborLimits::effective_max_depth`]).
+///
+/// Measured stack at this depth (macOS arm64): about 372 KiB unoptimized
+/// and 100 KiB optimized for `decompress`, 228 KiB unoptimized for
+/// `compress`. Assuming Windows x64 unoptimized frames up to twice as
+/// large, about 750 KiB: below the 1 MiB Windows main-thread stack and the
+/// 2 MiB default for threads Rust spawns. Raising the ceiling raises that
+/// requirement by roughly 6 KiB per level in a Windows debug build.
+pub const MAX_DEPTH_CEILING: usize = 128;
 
 /// Default maximum number of CBOR data items decoded from one payload.
 pub const DEFAULT_MAX_ITEMS: usize = 1_048_576;
@@ -44,12 +72,31 @@ pub const DEFAULT_MAX_ITEMS: usize = 1_048_576;
 /// Default maximum byte length of one compressed value codec payload: 8 KiB.
 pub const DEFAULT_MAX_VALUE_BYTES: usize = 8 * 1024;
 
+/// Default maximum bytes one decompression may materialize or copy: 64 MiB.
+///
+/// Four times [`DEFAULT_MAX_INPUT_BYTES`]: a legitimate document expands by
+/// a small factor (term identifiers become term names, compressed values
+/// become IRIs), while a hostile one can reference a long term or a large
+/// registered context from every one of millions of two-byte items. Raising
+/// it raises the worst-case memory and CPU one payload can demand.
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default base58 work one decompression may spend: 64 values of 6 KiB.
+///
+/// Rebuilding an `n`-byte base58 value takes on the order of `n * n` digit
+/// steps, charged as `n * n`. This default admits 64 values of 6,144
+/// bytes (about five seconds in a release build) and refuses the
+/// ~2,000 maximal values a 16 MiB payload could otherwise carry, which
+/// took over four minutes.
+pub const DEFAULT_MAX_BASE58_WORK: u64 = 64 * 6144 * 6144;
+
 /// Fail-closed limits for CBOR decoding and CBOR-LD conversion.
 #[derive(Clone, Copy, Debug)]
 pub struct CborLimits {
     /// Maximum encoded input size in bytes accepted by the decoder.
     pub max_input_bytes: usize,
-    /// Maximum nesting depth of CBOR items and JSON values.
+    /// Maximum nesting depth of CBOR items and JSON values; values above
+    /// [`MAX_DEPTH_CEILING`] are clamped to it.
     pub max_depth: usize,
     /// Maximum number of CBOR data items decoded from one payload.
     pub max_items: usize,
@@ -58,6 +105,32 @@ pub struct CborLimits {
     /// codecs). Longer strings pass through uncompressed on encode; longer
     /// byte strings are a typed error on decode.
     pub max_value_bytes: usize,
+    /// Maximum bytes one CBOR-LD decompression may materialize or copy:
+    /// term names and IRIs expanded from identifiers, reconstructed codec
+    /// values and date strings, term definitions copied per entry, and the
+    /// term scope copied when a context adds definitions (a registered
+    /// context applied again to the same parent scope is shared, not
+    /// copied). Exceeding it is a typed [`CborldError::ResourceLimit`] for
+    /// `output_bytes`.
+    pub max_output_bytes: usize,
+    /// Maximum base58 reconstruction work for one CBOR-LD decompression,
+    /// charged as the square of each value's byte length. This is CPU
+    /// work, not output. Exceeding it is a typed
+    /// [`CborldError::ResourceLimit`] for `base58_work`.
+    pub max_base58_work: u64,
+}
+
+impl CborLimits {
+    /// Returns the nesting depth actually enforced: `max_depth` clamped to
+    /// [`MAX_DEPTH_CEILING`].
+    #[must_use]
+    pub const fn effective_max_depth(&self) -> usize {
+        if self.max_depth < MAX_DEPTH_CEILING {
+            self.max_depth
+        } else {
+            MAX_DEPTH_CEILING
+        }
+    }
 }
 
 impl Default for CborLimits {
@@ -67,6 +140,8 @@ impl Default for CborLimits {
             max_depth: DEFAULT_MAX_DEPTH,
             max_items: DEFAULT_MAX_ITEMS,
             max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            max_base58_work: DEFAULT_MAX_BASE58_WORK,
         }
     }
 }
@@ -129,8 +204,8 @@ fn encode_into(
     limits: &CborLimits,
     depth: usize,
 ) -> Result<(), CborldError> {
-    if depth > limits.max_depth {
-        return Err(depth_error(limits.max_depth, depth));
+    if depth > limits.effective_max_depth() {
+        return Err(depth_error(limits.effective_max_depth(), depth));
     }
     match value {
         CborValue::Unsigned(n) => write_head(out, 0, *n),
@@ -224,7 +299,7 @@ fn f64_to_half(value: f64) -> Option<u16> {
     }
     if (-24..-14).contains(&exponent) {
         // Subnormal half: the value must be an exact multiple of 2^-24.
-        let drop = u32::try_from(28 - exponent).expect("range checked above");
+        let drop = u32::try_from(28 - exponent).ok()?;
         let significand = (1u64 << 52) | fraction;
         if significand & ((1u64 << drop) - 1) != 0 {
             return None;
@@ -239,7 +314,7 @@ fn f64_to_half(value: f64) -> Option<u16> {
 /// # Errors
 ///
 /// Returns [`CborldError::ResourceLimit`] when nesting exceeds
-/// `limits.max_depth`, and [`CborldError::Encode`] when a map contains
+/// the effective depth ([`CborLimits::effective_max_depth`]), and [`CborldError::Encode`] when a map contains
 /// duplicate keys.
 pub fn encode_canonical(value: &CborValue, limits: &CborLimits) -> Result<Vec<u8>, CborldError> {
     let mut out = Vec::new();
@@ -254,6 +329,39 @@ struct Decoder<'bytes> {
     limits: CborLimits,
 }
 
+/// What one CBOR head starts: a complete item or an open container.
+enum Head {
+    /// A complete scalar, string, or empty container.
+    Item(CborValue),
+    /// An array with this many (non-zero) items still to read.
+    Array(usize),
+    /// A map with this many (non-zero) entries still to read.
+    Map(usize),
+    /// A tag whose single content item is still to read.
+    Tag(u64),
+}
+
+/// One open container on the reader's explicit stack.
+enum Frame {
+    Array {
+        items: Vec<CborValue>,
+        remaining: usize,
+    },
+    Map {
+        entries: Vec<(CborValue, CborValue)>,
+        key: Option<CborValue>,
+        remaining: usize,
+    },
+    Tag(u64),
+}
+
+/// Upper bound on the capacity reserved from a declared container length.
+///
+/// The declared length is already checked against the remaining input, so
+/// this only stops one short header from reserving more than the items
+/// that follow can fill.
+const MAX_RESERVED_ITEMS: usize = 4096;
+
 impl<'bytes> Decoder<'bytes> {
     fn error(&self, detail: impl Into<String>) -> CborldError {
         CborldError::Decode {
@@ -266,42 +374,47 @@ impl<'bytes> Decoder<'bytes> {
         let end = self
             .pos
             .checked_add(count)
-            .filter(|end| *end <= self.bytes.len())
             .ok_or_else(|| self.error("truncated input"))?;
-        let slice = &self.bytes[self.pos..end];
+        let slice = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or_else(|| self.error("truncated input"))?;
         self.pos = end;
         Ok(slice)
+    }
+
+    fn take_array<const N: usize>(&mut self) -> Result<[u8; N], CborldError> {
+        let slice = self.take(N)?;
+        <[u8; N]>::try_from(slice).map_err(|_length| self.error("truncated input"))
     }
 
     fn read_argument(&mut self, additional: u8) -> Result<u64, CborldError> {
         match additional {
             0..=23 => Ok(u64::from(additional)),
-            24 => Ok(u64::from(self.take(1)?[0])),
-            25 => Ok(u64::from(u16::from_be_bytes(
-                self.take(2)?.try_into().expect("length checked"),
-            ))),
-            26 => Ok(u64::from(u32::from_be_bytes(
-                self.take(4)?.try_into().expect("length checked"),
-            ))),
-            27 => Ok(u64::from_be_bytes(
-                self.take(8)?.try_into().expect("length checked"),
-            )),
+            24 => Ok(u64::from(u8::from_be_bytes(self.take_array()?))),
+            25 => Ok(u64::from(u16::from_be_bytes(self.take_array()?))),
+            26 => Ok(u64::from(u32::from_be_bytes(self.take_array()?))),
+            27 => Ok(u64::from_be_bytes(self.take_array()?)),
             28..=30 => Err(self.error("reserved additional-information value")),
             _ => Err(self.error("indefinite-length item is refused")),
         }
     }
 
+    /// Reads a declared length and refuses it unless that many bytes remain.
+    ///
+    /// Every item takes at least one byte, so this also bounds container
+    /// lengths before any capacity is reserved.
     fn read_length(&mut self, additional: u8, what: &str) -> Result<usize, CborldError> {
         let length = self.read_argument(additional)?;
-        let remaining = (self.bytes.len() - self.pos) as u64;
-        if length > remaining {
-            return Err(self.error(format!("{what} length {length} exceeds remaining input")));
+        let remaining = self.bytes.len().saturating_sub(self.pos);
+        match usize::try_from(length) {
+            Ok(length) if length <= remaining => Ok(length),
+            _ => Err(self.error(format!("{what} length {length} exceeds remaining input"))),
         }
-        Ok(usize::try_from(length).expect("bounded by input size"))
     }
 
     fn count_item(&mut self) -> Result<(), CborldError> {
-        self.items += 1;
+        self.items = self.items.saturating_add(1);
         if self.items > self.limits.max_items {
             return Err(CborldError::ResourceLimit {
                 resource: CborldResource::Items,
@@ -312,58 +425,124 @@ impl<'bytes> Decoder<'bytes> {
         Ok(())
     }
 
-    fn decode_item(&mut self, depth: usize) -> Result<CborValue, CborldError> {
-        if depth > self.limits.max_depth {
-            return Err(depth_error(self.limits.max_depth, depth));
-        }
-        self.count_item()?;
-        let initial = self.take(1)?[0];
+    /// Reads one head and, for strings and scalars, its content.
+    fn read_head(&mut self) -> Result<Head, CborldError> {
+        let [initial] = self.take_array::<1>()?;
         let major = initial >> 5;
         let additional = initial & 0x1f;
-        match major {
-            0 => Ok(CborValue::Unsigned(self.read_argument(additional)?)),
-            1 => Ok(CborValue::Negative(self.read_argument(additional)?)),
+        Ok(match major {
+            0 => Head::Item(CborValue::Unsigned(self.read_argument(additional)?)),
+            1 => Head::Item(CborValue::Negative(self.read_argument(additional)?)),
             2 => {
                 let length = self.read_length(additional, "byte string")?;
-                Ok(CborValue::Bytes(self.take(length)?.to_vec()))
+                Head::Item(CborValue::Bytes(self.take(length)?.to_vec()))
             }
             3 => {
                 let length = self.read_length(additional, "text string")?;
                 let start = self.pos;
                 let raw = self.take(length)?;
                 match std::str::from_utf8(raw) {
-                    Ok(text) => Ok(CborValue::Text(text.to_string())),
-                    Err(_) => Err(CborldError::Decode {
-                        offset: start,
-                        detail: "text string is not valid UTF-8".to_string(),
-                    }),
+                    Ok(text) => Head::Item(CborValue::Text(text.to_string())),
+                    Err(_) => {
+                        return Err(CborldError::Decode {
+                            offset: start,
+                            detail: "text string is not valid UTF-8".to_string(),
+                        });
+                    }
                 }
             }
-            4 => {
-                let length = self.read_length(additional, "array")?;
-                let mut items = Vec::with_capacity(length.min(4096));
-                for _ in 0..length {
-                    items.push(self.decode_item(depth + 1)?);
+            4 => match self.read_length(additional, "array")? {
+                0 => Head::Item(CborValue::Array(Vec::new())),
+                length => Head::Array(length),
+            },
+            5 => match self.read_length(additional, "map")? {
+                0 => Head::Item(CborValue::Map(Vec::new())),
+                length => Head::Map(length),
+            },
+            6 => Head::Tag(self.read_argument(additional)?),
+            _ => Head::Item(self.decode_simple_or_float(additional)?),
+        })
+    }
+
+    /// Decodes one complete item without recursion.
+    ///
+    /// Open containers live on `stack`; the depth of the item about to be
+    /// read is `stack.len() + 1`, checked before the item is counted, which
+    /// is exactly the order and numbering of the former recursive reader.
+    fn decode_root(&mut self) -> Result<CborValue, CborldError> {
+        let mut stack: Vec<Frame> = Vec::new();
+        loop {
+            let depth = stack.len().saturating_add(1);
+            if depth > self.limits.effective_max_depth() {
+                return Err(depth_error(self.limits.effective_max_depth(), depth));
+            }
+            self.count_item()?;
+            let mut value = match self.read_head()? {
+                Head::Item(value) => value,
+                Head::Array(length) => {
+                    stack.push(Frame::Array {
+                        items: Vec::with_capacity(length.min(MAX_RESERVED_ITEMS)),
+                        remaining: length,
+                    });
+                    continue;
                 }
-                Ok(CborValue::Array(items))
-            }
-            5 => {
-                let length = self.read_length(additional, "map")?;
-                let mut entries = Vec::with_capacity(length.min(4096));
-                for _ in 0..length {
-                    let key = self.decode_item(depth + 1)?;
-                    let value = self.decode_item(depth + 1)?;
-                    entries.push((key, value));
+                Head::Map(length) => {
+                    stack.push(Frame::Map {
+                        entries: Vec::with_capacity(length.min(MAX_RESERVED_ITEMS)),
+                        key: None,
+                        remaining: length,
+                    });
+                    continue;
                 }
-                self.check_duplicate_keys(&entries, depth)?;
-                Ok(CborValue::Map(entries))
+                Head::Tag(tag) => {
+                    stack.push(Frame::Tag(tag));
+                    continue;
+                }
+            };
+            // Attach the completed item to its parents, closing every
+            // container it completes.
+            loop {
+                let Some(frame) = stack.last_mut() else {
+                    return Ok(value);
+                };
+                match frame {
+                    Frame::Array { items, remaining } => {
+                        items.push(value);
+                        *remaining = remaining.saturating_sub(1);
+                        if *remaining > 0 {
+                            break;
+                        }
+                        let items = std::mem::take(items);
+                        stack.pop();
+                        value = CborValue::Array(items);
+                    }
+                    Frame::Map {
+                        entries,
+                        key,
+                        remaining,
+                    } => {
+                        let Some(map_key) = key.take() else {
+                            *key = Some(value);
+                            break;
+                        };
+                        entries.push((map_key, value));
+                        *remaining = remaining.saturating_sub(1);
+                        if *remaining > 0 {
+                            break;
+                        }
+                        let entries = std::mem::take(entries);
+                        stack.pop();
+                        // The map's own depth: one more than its open parents.
+                        self.check_duplicate_keys(&entries, stack.len().saturating_add(1))?;
+                        value = CborValue::Map(entries);
+                    }
+                    Frame::Tag(tag) => {
+                        let tag = *tag;
+                        stack.pop();
+                        value = CborValue::Tag(tag, Box::new(value));
+                    }
+                }
             }
-            6 => {
-                let tag = self.read_argument(additional)?;
-                let inner = self.decode_item(depth + 1)?;
-                Ok(CborValue::Tag(tag, Box::new(inner)))
-            }
-            _ => self.decode_simple_or_float(additional),
         }
     }
 
@@ -373,18 +552,15 @@ impl<'bytes> Decoder<'bytes> {
             21 => Ok(CborValue::Bool(true)),
             22 => Ok(CborValue::Null),
             23 => Err(self.error("simple value undefined (0xf7) is refused")),
-            25 => {
-                let raw = u16::from_be_bytes(self.take(2)?.try_into().expect("length checked"));
-                Ok(CborValue::Float(half_to_f64(raw)))
-            }
-            26 => {
-                let raw = u32::from_be_bytes(self.take(4)?.try_into().expect("length checked"));
-                Ok(CborValue::Float(f64::from(f32::from_bits(raw))))
-            }
-            27 => {
-                let raw = u64::from_be_bytes(self.take(8)?.try_into().expect("length checked"));
-                Ok(CborValue::Float(f64::from_bits(raw)))
-            }
+            25 => Ok(CborValue::Float(half_to_f64(u16::from_be_bytes(
+                self.take_array()?,
+            )))),
+            26 => Ok(CborValue::Float(f64::from(f32::from_bits(
+                u32::from_be_bytes(self.take_array()?),
+            )))),
+            27 => Ok(CborValue::Float(f64::from_bits(u64::from_be_bytes(
+                self.take_array()?,
+            )))),
             31 => Err(self.error("indefinite-length break (0xff) is refused")),
             other => Err(self.error(format!("unassigned simple value {other} is refused"))),
         }
@@ -398,17 +574,18 @@ impl<'bytes> Decoder<'bytes> {
         let mut encoded_keys: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
         for (key, _) in entries {
             let mut bytes = Vec::new();
-            encode_into(key, &mut bytes, &self.limits, depth + 1)?;
+            encode_into(key, &mut bytes, &self.limits, depth.saturating_add(1))?;
             encoded_keys.push(bytes);
         }
         encoded_keys.sort_unstable();
-        for pair in encoded_keys.windows(2) {
-            if pair[0] == pair[1] {
-                return Err(CborldError::Decode {
-                    offset: self.pos,
-                    detail: "duplicate map key".to_string(),
-                });
-            }
+        if encoded_keys
+            .windows(2)
+            .any(|pair| pair.first() == pair.get(1))
+        {
+            return Err(CborldError::Decode {
+                offset: self.pos,
+                detail: "duplicate map key".to_string(),
+            });
         }
         Ok(())
     }
@@ -455,7 +632,7 @@ pub fn decode(bytes: &[u8], limits: &CborLimits) -> Result<CborValue, CborldErro
         items: 0,
         limits: *limits,
     };
-    let value = decoder.decode_item(1)?;
+    let value = decoder.decode_root()?;
     if decoder.pos != bytes.len() {
         return Err(CborldError::Decode {
             offset: decoder.pos,

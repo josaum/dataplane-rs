@@ -36,6 +36,7 @@
 //! into that node's values, so an identifier a sibling subtree's context
 //! assigned would not yet exist when the decoder needed it.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
@@ -230,7 +231,7 @@ fn resolve_registry_entry(
 fn depth_error(limits: &CborLimits, observed: usize) -> CborldError {
     CborldError::ResourceLimit {
         resource: CborldResource::Depth,
-        limit: limits.max_depth,
+        limit: limits.effective_max_depth(),
         observed,
     }
 }
@@ -241,7 +242,7 @@ fn json_to_cbor(
     limits: &CborLimits,
     depth: usize,
 ) -> Result<CborValue, CborldError> {
-    if depth > limits.max_depth {
+    if depth > limits.effective_max_depth() {
         return Err(depth_error(limits, depth));
     }
     Ok(match value {
@@ -312,7 +313,7 @@ fn cbor_to_json(
     limits: &CborLimits,
     depth: usize,
 ) -> Result<Value, CborldError> {
-    if depth > limits.max_depth {
+    if depth > limits.effective_max_depth() {
         return Err(depth_error(limits, depth));
     }
     Ok(match value {
@@ -426,7 +427,7 @@ impl Compressor<'_> {
         active: &ActiveContext,
         depth: usize,
     ) -> Result<CborValue, CborldError> {
-        if depth > self.limits.max_depth {
+        if depth > self.limits.effective_max_depth() {
             return Err(depth_error(&self.limits, depth));
         }
         let mut entries: Vec<(CborValue, CborValue)> = Vec::with_capacity(object.len());
@@ -513,7 +514,7 @@ impl Compressor<'_> {
                 .provided
                 .get(iri)
                 .ok_or_else(|| CborldError::UnregisteredContext { iri: iri.clone() })?;
-            *scoped = load_context_document(&mut self.registry, scoped, iri, document)?;
+            *scoped = load_context_document(&mut self.registry, scoped, iri, document, &mut 0)?;
             return Ok(
                 match self
                     .entry
@@ -525,7 +526,7 @@ impl Compressor<'_> {
                 },
             );
         }
-        *scoped = load_context(&mut self.registry, scoped, item)?;
+        *scoped = load_context(&mut self.registry, scoped, item, &mut 0)?;
         json_to_cbor(item, &self.limits, depth + 1)
     }
 
@@ -587,7 +588,7 @@ impl Compressor<'_> {
         value: &Value,
         depth: usize,
     ) -> Result<CborValue, CborldError> {
-        if depth > self.limits.max_depth {
+        if depth > self.limits.effective_max_depth() {
             return Err(depth_error(&self.limits, depth));
         }
         match value {
@@ -812,16 +813,64 @@ struct Decompressor<'opts> {
     limits: CborLimits,
     provided: &'opts ProvidedContexts,
     entry: &'static RegistryEntry,
+    /// Bytes materialized or copied so far, against `limits.max_output_bytes`.
+    output_spent: Cell<usize>,
+    /// Base58 digit work so far, against `limits.max_base58_work`.
+    base58_spent: Cell<u64>,
+    /// Registered contexts already applied, keyed by parent scope identity
+    /// and IRI, holding the parent (so its identity stays unique) and the
+    /// resulting scope.
+    context_cache: BTreeMap<(usize, String), (ActiveContext, ActiveContext)>,
 }
 
 impl Decompressor<'_> {
+    /// Charges `bytes` against the output budget.
+    ///
+    /// Called wherever decompression produces more than it read: a term or
+    /// IRI expanded from an identifier, a reconstructed codec value, a term
+    /// definition copied per entry, or a scope copied by a context.
+    fn charge(&self, bytes: usize) -> Result<(), CborldError> {
+        let spent = self.output_spent.get().saturating_add(bytes);
+        self.output_spent.set(spent);
+        if spent > self.limits.max_output_bytes {
+            return Err(CborldError::ResourceLimit {
+                resource: CborldResource::OutputBytes,
+                limit: self.limits.max_output_bytes,
+                observed: spent,
+            });
+        }
+        Ok(())
+    }
+
+    /// Charges a base58 reconstruction of `length` bytes at its quadratic
+    /// cost (`length` squared) against `limits.max_base58_work`.
+    ///
+    /// This is CPU work, not output: the reconstructed string is charged
+    /// to the output budget separately, where it is produced.
+    fn charge_base58(&self, length: usize) -> Result<(), CborldError> {
+        let length = u64::try_from(length).unwrap_or(u64::MAX);
+        let spent = self
+            .base58_spent
+            .get()
+            .saturating_add(length.saturating_mul(length));
+        self.base58_spent.set(spent);
+        if spent > self.limits.max_base58_work {
+            return Err(CborldError::ResourceLimit {
+                resource: CborldResource::Base58Work,
+                limit: usize::try_from(self.limits.max_base58_work).unwrap_or(usize::MAX),
+                observed: usize::try_from(spent).unwrap_or(usize::MAX),
+            });
+        }
+        Ok(())
+    }
+
     fn decode_node(
         &mut self,
         entries: &[(CborValue, CborValue)],
         active: &ActiveContext,
         depth: usize,
     ) -> Result<serde_json::Map<String, Value>, CborldError> {
-        if depth > self.limits.max_depth {
+        if depth > self.limits.effective_max_depth() {
             return Err(depth_error(&self.limits, depth));
         }
         let mut output = serde_json::Map::new();
@@ -862,11 +911,12 @@ impl Decompressor<'_> {
                 CborValue::Unsigned(0 | 1) => {}
                 CborValue::Unsigned(id) => {
                     let plural = id % 2 == 1;
-                    let base = id - u64::from(plural);
+                    let base = id.saturating_sub(u64::from(plural));
                     let term = self
                         .registry
                         .term_of(base)
                         .ok_or(CborldError::UnknownTermId { id: *id })?;
+                    self.charge(term.len())?;
                     named.push((term.to_string(), plural, value));
                 }
                 CborValue::Text(term) => {
@@ -875,6 +925,7 @@ impl Decompressor<'_> {
                             "@context must be carried under compressed key 0 or 1".to_string(),
                         ));
                     }
+                    self.charge(term.len())?;
                     named.push((term.clone(), false, value));
                 }
                 other => {
@@ -887,15 +938,25 @@ impl Decompressor<'_> {
         }
         named.sort_by(|a, b| a.0.cmp(&b.0));
         for pair in named.windows(2) {
-            if pair[0].0 == pair[1].0 {
+            if let [first, second] = pair
+                && first.0 == second.0
+            {
                 return Err(CborldError::Envelope(format!(
                     "term {} appears under more than one key",
-                    pair[0].0
+                    first.0
                 )));
             }
         }
         for (term, plural, value) in named {
             let def = scoped.definition(&term).cloned();
+            if let Some(def) = &def {
+                self.charge(
+                    def.id
+                        .as_deref()
+                        .map_or(0, str::len)
+                        .saturating_add(def.value_type.as_deref().map_or(0, str::len)),
+                )?;
+            }
             let decoded = if plural {
                 let CborValue::Array(items) = value else {
                     return Err(CborldError::Envelope(format!(
@@ -943,7 +1004,7 @@ impl Decompressor<'_> {
                     })?;
                 return self.apply_context_iri(iri, scoped);
             }
-            CborValue::Map(_) => cbor_to_json(value, &self.limits, depth + 1)?,
+            CborValue::Map(_) => cbor_to_json(value, &self.limits, depth.saturating_add(1))?,
             other => {
                 return Err(CborldError::Envelope(format!(
                     "encoded @context must be a map, a text string, or a \
@@ -952,7 +1013,9 @@ impl Decompressor<'_> {
                 )));
             }
         };
-        *scoped = load_context(&mut self.registry, scoped, &context)?;
+        let mut copied = 0;
+        *scoped = load_context(&mut self.registry, scoped, &context, &mut copied)?;
+        self.charge(copied)?;
         Ok(context)
     }
 
@@ -968,7 +1031,22 @@ impl Decompressor<'_> {
             .ok_or_else(|| CborldError::UnregisteredContext {
                 iri: iri.to_string(),
             })?;
-        *scoped = load_context_document(&mut self.registry, scoped, iri, document)?;
+        self.charge(iri.len())?;
+        let key = (scoped.map_identity(), iri.to_string());
+        if let Some((_parent, applied)) = self.context_cache.get(&key) {
+            // Same registered context on the same parent scope: share the
+            // scope already built instead of copying it again.
+            *scoped = applied.clone();
+            return Ok(Value::String(iri.to_string()));
+        }
+        let mut copied = 0;
+        let applied =
+            load_context_document(&mut self.registry, scoped, iri, document, &mut copied)?;
+        self.charge(copied)?;
+        // The cached parent keeps its map alive, so its identity cannot be
+        // reused by another scope while the entry exists.
+        self.context_cache
+            .insert(key, (std::mem::replace(scoped, applied.clone()), applied));
         Ok(Value::String(iri.to_string()))
     }
 
@@ -1014,6 +1092,7 @@ impl Decompressor<'_> {
                 table_type: key.to_string(),
                 registry_entry_id: self.entry.id,
             })?;
+        self.charge(decoded.len())?;
         Ok(Some(Value::String(decoded.to_string())))
     }
 
@@ -1025,7 +1104,7 @@ impl Decompressor<'_> {
         value: &CborValue,
         depth: usize,
     ) -> Result<Value, CborldError> {
-        if depth > self.limits.max_depth {
+        if depth > self.limits.effective_max_depth() {
             return Err(depth_error(&self.limits, depth));
         }
         if let CborValue::Map(entries) = value {
@@ -1047,11 +1126,13 @@ impl Decompressor<'_> {
             TableType::Typed(XSD_DATE_IRI) => match value {
                 CborValue::Unsigned(_) | CborValue::Negative(_) => {
                     let seconds = int_value(value)?;
-                    format_xsd_date(seconds).map(Value::String).ok_or_else(|| {
+                    let text = format_xsd_date(seconds).ok_or_else(|| {
                         CborldError::NumberRange(format!(
                             "xsd:date seconds {seconds} fall outside years 0000-9999"
                         ))
-                    })
+                    })?;
+                    self.charge(text.len())?;
+                    Ok(Value::String(text))
                 }
                 other => self.decode_plain(term, def, active, other, depth),
             },
@@ -1098,14 +1179,21 @@ impl Decompressor<'_> {
         depth: usize,
     ) -> Result<Value, CborldError> {
         match value {
-            CborValue::Unsigned(id) => self
-                .registry
-                .term_of(*id)
-                .map(|term| Value::String(term.to_string()))
-                .ok_or(CborldError::UnknownTermId { id: *id }),
+            CborValue::Unsigned(id) => {
+                let term = self
+                    .registry
+                    .term_of(*id)
+                    .ok_or(CborldError::UnknownTermId { id: *id })?;
+                self.charge(term.len())?;
+                Ok(Value::String(term.to_string()))
+            }
             CborValue::Text(text) => Ok(Value::String(text.clone())),
             CborValue::Array(items) => match items.first() {
-                Some(CborValue::Unsigned(prefix_id)) => self.decode_url_array(*prefix_id, items),
+                Some(CborValue::Unsigned(prefix_id)) => {
+                    let decoded = self.decode_url_array(*prefix_id, items)?;
+                    self.charge(decoded.as_str().map_or(0, str::len))?;
+                    Ok(decoded)
+                }
                 _ => self.decode_plain(term, def, active, value, depth),
             },
             other => Err(CborldError::Envelope(format!(
@@ -1192,6 +1280,7 @@ impl Decompressor<'_> {
             CborValue::Text(text) => Ok(text.clone()),
             CborValue::Bytes(bytes) => {
                 self.check_value_bytes(bytes.len())?;
+                self.charge_base58(bytes.len())?;
                 Ok(format!("z{}", base58btc_encode(bytes)))
             }
             other => Err(CborldError::Envelope(format!(
@@ -1213,9 +1302,16 @@ impl Decompressor<'_> {
             ));
         };
         match *header {
-            MULTIBASE_BASE58BTC_HEADER => Ok(Value::String(format!("z{}", base58btc_encode(body)))),
+            MULTIBASE_BASE58BTC_HEADER => {
+                self.charge_base58(body.len())?;
+                let text = format!("z{}", base58btc_encode(body));
+                self.charge(text.len())?;
+                Ok(Value::String(text))
+            }
             MULTIBASE_BASE64URL_HEADER => {
-                Ok(Value::String(format!("u{}", base64url_nopad_encode(body))))
+                let text = format!("u{}", base64url_nopad_encode(body));
+                self.charge(text.len())?;
+                Ok(Value::String(text))
             }
             other => Err(CborldError::Unsupported(format!(
                 "multibase header {other:#04x} is outside the vendored subset (z, u)"
@@ -1246,13 +1342,13 @@ impl Decompressor<'_> {
         match value {
             CborValue::Unsigned(_) | CborValue::Negative(_) => {
                 let seconds = int_value(value)?;
-                format_xsd_datetime_seconds(seconds)
-                    .map(Value::String)
-                    .ok_or_else(|| {
-                        CborldError::NumberRange(format!(
-                            "xsd:dateTime seconds {seconds} fall outside years 0000-9999"
-                        ))
-                    })
+                let text = format_xsd_datetime_seconds(seconds).ok_or_else(|| {
+                    CborldError::NumberRange(format!(
+                        "xsd:dateTime seconds {seconds} fall outside years 0000-9999"
+                    ))
+                })?;
+                self.charge(text.len())?;
+                Ok(Value::String(text))
             }
             CborValue::Array(items) => match items.as_slice() {
                 [
@@ -1271,13 +1367,13 @@ impl Decompressor<'_> {
                         )));
                     }
                     let total = i128::from(int_value(seconds)?) * 1000 + i128::from(*millis);
-                    format_xsd_datetime_millis(total)
-                        .map(Value::String)
-                        .ok_or_else(|| {
-                            CborldError::NumberRange(format!(
-                                "xsd:dateTime instant {total} ms falls outside years 0000-9999"
-                            ))
-                        })
+                    let text = format_xsd_datetime_millis(total).ok_or_else(|| {
+                        CborldError::NumberRange(format!(
+                            "xsd:dateTime instant {total} ms falls outside years 0000-9999"
+                        ))
+                    })?;
+                    self.charge(text.len())?;
+                    Ok(Value::String(text))
                 }
                 _ => self.decode_plain(term, def, active, value, depth),
             },
@@ -1381,7 +1477,10 @@ pub fn compress(document: &Value, options: &CborldOptions) -> Result<Vec<u8>, Cb
 /// # Errors
 ///
 /// Returns [`CborldError::ResourceLimit`] and [`CborldError::Decode`] for
-/// oversized or malformed CBOR, [`CborldError::Envelope`] for payloads that
+/// oversized or malformed CBOR, [`CborldError::ResourceLimit`] for
+/// `output_bytes` when expanding identifiers, codec values, or applied
+/// contexts would exceed `limits.max_output_bytes`,
+/// [`CborldError::Envelope`] for payloads that
 /// are not the vendored envelope shape,
 /// [`CborldError::UnknownRegistryEntry`] for an identifier outside the
 /// vendored registry, [`CborldError::ProvisionalRegistryEntry`] for a
@@ -1429,6 +1528,9 @@ pub fn decompress(bytes: &[u8], options: &CborldOptions) -> Result<Value, Cborld
         limits: options.limits,
         provided: &options.provided_contexts,
         entry,
+        output_spent: Cell::new(0),
+        base58_spent: Cell::new(0),
+        context_cache: BTreeMap::new(),
     };
     let object = decompressor.decode_node(entries, &ActiveContext::default(), 1)?;
     Ok(Value::Object(object))

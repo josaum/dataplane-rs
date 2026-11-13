@@ -103,7 +103,13 @@ pub(crate) fn check_declared_table_sizes(
 pub struct JellyDecoder {
     options: JellyDecoderOptions,
     stream: Option<TermDecoder>,
+    /// Set by the first error; every later frame fails closed.
+    failed: bool,
 }
+
+/// Message of the error every frame gets after the decoder has failed.
+const POISONED: &str = "stream decoder failed on an earlier frame; its lookup table and \
+                        repeated-term state are undefined, so it refuses every later frame";
 
 impl JellyDecoder {
     /// Creates a decoder for one Jelly stream governed by `options`.
@@ -112,6 +118,7 @@ impl JellyDecoder {
         Self {
             options,
             stream: None,
+            failed: false,
         }
     }
 
@@ -131,7 +138,27 @@ impl JellyDecoder {
     /// configured maximum; [`JellyError::Lookup`], [`JellyError::Frame`],
     /// and [`JellyError::Term`] for malformed row content; and
     /// [`JellyError::Quad`] when batch construction hits a quad limit.
+    ///
+    /// After any error the decoder is poisoned: frame state is mutated in
+    /// place without rollback, so every later call returns
+    /// [`JellyError::Frame`] instead of decoding against half-applied
+    /// lookup tables.
     pub fn decode_frame(&mut self, frame: &RdfStreamFrame) -> Result<RecordBatch, JellyError> {
+        if self.failed {
+            return Err(JellyError::Frame(POISONED.into()));
+        }
+        let result = self.decode_frame_unchecked(frame);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// Decodes one frame, mutating stream state in place (no rollback).
+    fn decode_frame_unchecked(
+        &mut self,
+        frame: &RdfStreamFrame,
+    ) -> Result<RecordBatch, JellyError> {
         let mut builder = QuadBatchBuilder::new(self.options.quad_limits);
         for row in &frame.rows {
             let row = row

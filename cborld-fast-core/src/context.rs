@@ -19,6 +19,7 @@
 //! type-scoped contexts nested inside term definitions.
 
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use serde_json::Value;
 
@@ -82,10 +83,20 @@ pub(crate) struct TermDef {
     pub(crate) value_type: Option<String>,
 }
 
+/// Fixed per-definition overhead charged by [`ActiveContext::weight`], in
+/// bytes: roughly one B-tree slot plus the two string headers it owns.
+const TERM_DEF_OVERHEAD_BYTES: usize = 64;
+
 /// Scoped term definitions active at one node.
+///
+/// The map is shared: cloning a scope for a node that carries no context
+/// of its own is O(1), and the map is copied only when a context actually
+/// adds definitions (see [`load_context`]). A recursive JSON-LD tree whose
+/// every node cloned the full map made decompression quadratic.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ActiveContext {
-    term_map: BTreeMap<String, TermDef>,
+    term_map: Rc<BTreeMap<String, TermDef>>,
+    weight: usize,
 }
 
 impl ActiveContext {
@@ -93,6 +104,27 @@ impl ActiveContext {
     pub(crate) fn definition(&self, term: &str) -> Option<&TermDef> {
         self.term_map.get(term)
     }
+
+    /// Identity of the shared definition map, for caching context
+    /// applications per parent scope. Stable while `self` is alive.
+    pub(crate) fn map_identity(&self) -> usize {
+        Rc::as_ptr(&self.term_map) as usize
+    }
+
+    fn insert(&mut self, term: &str, def: TermDef) {
+        let added = term_weight(term, &def);
+        if let Some(previous) = Rc::make_mut(&mut self.term_map).insert(term.to_string(), def) {
+            self.weight = self.weight.saturating_sub(term_weight(term, &previous));
+        }
+        self.weight = self.weight.saturating_add(added);
+    }
+}
+
+fn term_weight(term: &str, def: &TermDef) -> usize {
+    TERM_DEF_OVERHEAD_BYTES
+        .saturating_add(term.len())
+        .saturating_add(def.id.as_deref().map_or(0, str::len))
+        .saturating_add(def.value_type.as_deref().map_or(0, str::len))
 }
 
 /// Returns whether `term` is a vendored JSON-LD keyword.
@@ -116,10 +148,14 @@ pub(crate) fn is_keyword(term: &str) -> bool {
 /// context, [`CborldError::Unsupported`] for `@context: null`, `@import`,
 /// and scoped contexts, and [`CborldError::Document`] for definitions
 /// outside the accepted shapes.
+///
+/// `copied` grows by the weight of the scope when applying the context
+/// had to copy it (any definition added), so callers can charge the copy.
 pub(crate) fn load_context(
     registry: &mut TermIdRegistry,
     active: &ActiveContext,
     context: &Value,
+    copied: &mut usize,
 ) -> Result<ActiveContext, CborldError> {
     let object = match context {
         Value::String(iri) => {
@@ -144,13 +180,12 @@ pub(crate) fn load_context(
         ));
     }
     let mut next = active.clone();
-    let mut terms: Vec<&String> = object.keys().collect();
-    terms.sort_unstable();
-    for term in terms {
+    let mut terms: Vec<(&String, &Value)> = object.iter().collect();
+    terms.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (term, definition) in terms {
         if is_keyword(term) {
             continue;
         }
-        let definition = &object[term.as_str()];
         let def = match definition {
             Value::Null => continue,
             Value::String(iri) => TermDef {
@@ -176,7 +211,10 @@ pub(crate) fn load_context(
             }
         };
         registry.assign(term);
-        next.term_map.insert(term.clone(), def);
+        next.insert(term, def);
+    }
+    if !Rc::ptr_eq(&next.term_map, &active.term_map) {
+        *copied = copied.saturating_add(next.weight);
     }
     Ok(next)
 }
@@ -193,11 +231,13 @@ pub(crate) fn load_context(
 ///
 /// Returns [`CborldError::Document`] when `document` is not a JSON object,
 /// plus every error [`load_context`] produces for the content itself.
+/// `copied` accumulates the scope copies of every array element.
 pub(crate) fn load_context_document(
     registry: &mut TermIdRegistry,
     active: &ActiveContext,
     iri: &str,
     document: &Value,
+    copied: &mut usize,
 ) -> Result<ActiveContext, CborldError> {
     let Value::Object(object) = document else {
         return Err(CborldError::Document(format!(
@@ -209,12 +249,12 @@ pub(crate) fn load_context_document(
         Some(Value::Array(items)) => {
             let mut next = active.clone();
             for item in items {
-                next = load_context(registry, &next, item)?;
+                next = load_context(registry, &next, item, copied)?;
             }
             Ok(next)
         }
-        Some(wrapped) => load_context(registry, active, wrapped),
-        None => load_context(registry, active, document),
+        Some(wrapped) => load_context(registry, active, wrapped, copied),
+        None => load_context(registry, active, document, copied),
     }
 }
 

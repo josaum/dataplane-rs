@@ -139,6 +139,10 @@ fn append_dict_opt(
 
 impl QuadBatchBuilder {
     /// Creates an empty builder governed by `limits`.
+    ///
+    /// Reserves Arrow's default column capacity (1,024 rows per column,
+    /// about 130 KiB); use [`QuadBatchBuilder::with_capacity`] when many
+    /// small batches are built.
     #[must_use]
     pub fn new(limits: QuadLimits) -> Self {
         Self {
@@ -159,6 +163,34 @@ impl QuadBatchBuilder {
             source_offset_start: UInt64Builder::new(),
             source_offset_end: UInt64Builder::new(),
             observed_at: TimestampMicrosecondBuilder::new().with_timezone("UTC"),
+        }
+    }
+
+    /// Creates an empty builder that reserves room for `capacity` quads.
+    ///
+    /// Columns grow on demand past `capacity`, so a small value only costs
+    /// reallocations when the batch turns out large; it never limits the
+    /// batch (that is `limits`' job).
+    #[must_use]
+    pub fn with_capacity(limits: QuadLimits, capacity: usize) -> Self {
+        Self {
+            limits,
+            quads: 0,
+            retained_term_bytes: 0,
+            subject_kind: StringDictionaryBuilder::with_capacity(capacity, 2, 8),
+            subject_value: StringDictionaryBuilder::with_capacity(capacity, capacity, 0),
+            predicate_iri: StringDictionaryBuilder::with_capacity(capacity, capacity, 0),
+            object_kind: StringDictionaryBuilder::with_capacity(capacity, 4, 16),
+            object_value: StringBuilder::with_capacity(capacity, 0),
+            object_datatype: StringDictionaryBuilder::with_capacity(capacity, capacity, 0),
+            object_language: StringDictionaryBuilder::with_capacity(capacity, capacity, 0),
+            graph_kind: StringDictionaryBuilder::with_capacity(capacity, 3, 16),
+            graph_value: StringDictionaryBuilder::with_capacity(capacity, capacity, 0),
+            source_artifact: StringDictionaryBuilder::with_capacity(capacity, 1, 0),
+            source_sha256: FixedSizeBinaryBuilder::with_capacity(capacity, 32),
+            source_offset_start: UInt64Builder::with_capacity(capacity),
+            source_offset_end: UInt64Builder::with_capacity(capacity),
+            observed_at: TimestampMicrosecondBuilder::with_capacity(capacity).with_timezone("UTC"),
         }
     }
 

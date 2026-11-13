@@ -15,6 +15,8 @@ pub enum JellyResource {
     DatatypeTable,
     /// RDF 1.2 triple-term nesting depth.
     QuotedDepth,
+    /// Operations decoded from one patch frame.
+    PatchOps,
 }
 
 impl JellyResource {
@@ -26,6 +28,7 @@ impl JellyResource {
             Self::NameTable => "name_table",
             Self::DatatypeTable => "datatype_table",
             Self::QuotedDepth => "quoted_depth",
+            Self::PatchOps => "patch_ops",
         }
     }
 }
@@ -56,13 +59,13 @@ pub enum JellyError {
     Options(String),
     /// A declared lookup table size, or an observed triple-term nesting
     /// depth, exceeds the configured maximum.
-    #[error("resource_limit: {resource}: declared {observed} exceeds limit {limit}")]
+    #[error("resource_limit: {resource}: {observed} exceeds limit {limit}")]
     ResourceLimit {
         /// Governed lookup table.
         resource: JellyResource,
         /// Configured inclusive limit.
         limit: u32,
-        /// Declared value beyond the limit.
+        /// Declared or observed value beyond the limit.
         observed: u32,
     },
     /// A lookup table identifier is out of range, unset, or misused.

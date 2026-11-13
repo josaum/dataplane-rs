@@ -2,8 +2,8 @@
 // Rust guideline compliant 2026-02-21
 //! Fail-closed decoding of Jelly-Patch stream frames into patch ops.
 
-use oxrdf::Term;
-use quad_fast_core::{QuadBatchBuilder, QuadLimits};
+use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term, Triple};
+use quad_fast_core::{QuadBatchBuilder, QuadError, QuadLimits, QuadResource, encode_triple_term};
 
 use crate::{
     decoder::check_declared_table_sizes,
@@ -16,6 +16,29 @@ use crate::{
     },
     terms::{TermDecoder, blank_node},
 };
+
+/// Default most operations one patch frame may decode into: 8,192.
+///
+/// Equal to [`DEFAULT_PATCH_ROWS_PER_FRAME`](crate::DEFAULT_PATCH_ROWS_PER_FRAME),
+/// the most operation rows the default encoder puts in one frame, so the
+/// encoder's own output always decodes at default options. Each statement
+/// run is its own Arrow batch reserved for eight rows and grown on
+/// demand: a 4 KB frame of 1,001 one-row runs allocates about 18 MB in
+/// total (measured), against about 330 MB when every run reserved Arrow's
+/// default 1,024 rows. The frame-wide quad limits bound the content.
+pub const DEFAULT_MAX_PATCH_OPS_PER_FRAME: usize =
+    crate::patch::encoder::DEFAULT_PATCH_ROWS_PER_FRAME;
+
+/// Rows reserved up front for one statement run's batch builder.
+///
+/// A run's builder grows on demand, so this only sizes the first
+/// allocation. Arrow's default (1,024 rows, about 130 KiB per builder) made
+/// a 4 KB frame of alternating one-row runs reserve hundreds of MB.
+const RUN_BUILDER_CAPACITY: usize = 8;
+
+/// Message of the error every call returns after the decoder has failed.
+const POISONED: &str = "patch decoder failed on an earlier frame; its lookup table, repeated-term, \
+                        and transaction state are undefined, so it refuses every later frame";
 
 /// Fail-closed configuration for [`JellyPatchDecoder`].
 ///
@@ -31,8 +54,18 @@ pub struct JellyPatchDecoderOptions {
     pub max_name_table_size: u32,
     /// Largest datatype lookup table this decoder accepts.
     pub max_datatype_table_size: u32,
-    /// Limits applied to every batch built from consecutive statements.
+    /// Limits applied to the statements of one frame, summed across all of
+    /// its add and delete runs (a frame of many small runs cannot retain
+    /// more than one batch could).
     pub quad_limits: QuadLimits,
+    /// Most operations (statement runs, transaction markers, headers) one
+    /// frame may decode into.
+    ///
+    /// Every run of add or delete rows becomes its own Arrow batch, so a
+    /// frame of alternating one-row runs (about six wire bytes each) would
+    /// otherwise materialize one batch per row: 20,000 such rows passed a
+    /// 1 GiB allocation cap. Defaults to [`DEFAULT_MAX_PATCH_OPS_PER_FRAME`].
+    pub max_ops_per_frame: usize,
 }
 
 impl Default for JellyPatchDecoderOptions {
@@ -42,6 +75,7 @@ impl Default for JellyPatchDecoderOptions {
             max_name_table_size: crate::encoder::DEFAULT_MAX_NAME_TABLE_SIZE,
             max_datatype_table_size: crate::encoder::DEFAULT_MAX_DATATYPE_TABLE_SIZE,
             quad_limits: QuadLimits::default(),
+            max_ops_per_frame: DEFAULT_MAX_PATCH_OPS_PER_FRAME,
         }
     }
 }
@@ -100,6 +134,8 @@ struct PendingBatch {
 pub struct JellyPatchDecoder {
     options: JellyPatchDecoderOptions,
     state: Option<PatchState>,
+    /// Set by the first error; every later call fails closed.
+    failed: bool,
 }
 
 impl JellyPatchDecoder {
@@ -109,6 +145,7 @@ impl JellyPatchDecoder {
         Self {
             options,
             state: None,
+            failed: false,
         }
     }
 
@@ -125,14 +162,42 @@ impl JellyPatchDecoder {
     /// triple terms outside the object position or without the `rdf_star`
     /// options flag, generalized statements, namespace rows, versions other
     /// than 1); [`JellyError::ResourceLimit`] when a declared table
-    /// exceeds a configured maximum; [`JellyError::Lookup`],
+    /// exceeds a configured maximum or the frame would decode into more
+    /// than `max_ops_per_frame` operations; [`JellyError::Lookup`],
     /// [`JellyError::Frame`], and [`JellyError::Term`] for malformed row
     /// content or ordering (including transaction and header-placement
-    /// violations); and [`JellyError::Quad`] when batch construction hits
-    /// a quad limit.
+    /// violations); and [`JellyError::Quad`] when the frame's statements,
+    /// summed across all runs, hit a quad limit.
+    ///
+    /// After any error the decoder is poisoned: frame state is mutated in
+    /// place without rollback, so this and [`Self::finish`] return
+    /// [`JellyError::Frame`] for every later call instead of decoding later
+    /// frames against half-applied tables.
     pub fn decode_frame(&mut self, frame: &RdfPatchFrame) -> Result<Vec<PatchOp>, JellyError> {
+        if self.failed {
+            return Err(JellyError::Frame(POISONED.into()));
+        }
+        let result = self.decode_frame_unchecked(frame);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// Decodes one frame, mutating stream state in place.
+    ///
+    /// State is not rolled back on error; [`Self::decode_frame`] poisons
+    /// the decoder instead.
+    fn decode_frame_unchecked(
+        &mut self,
+        frame: &RdfPatchFrame,
+    ) -> Result<Vec<PatchOp>, JellyError> {
         let mut ops = Vec::new();
         let mut pending: Option<PendingBatch> = None;
+        let quad_limits = self.options.quad_limits;
+        let max_ops = self.options.max_ops_per_frame;
+        let mut frame_quads: usize = 0;
+        let mut frame_bytes: usize = 0;
         // The vendored schema requires header rows at the start of the
         // patch frame; options and lookup entry rows do not displace them.
         let mut non_header_row_seen = false;
@@ -148,20 +213,24 @@ impl JellyPatchDecoder {
                     non_header_row_seen = true;
                     let is_add = matches!(row, rdf_patch_row::Row::StatementAdd(_));
                     let quad = self.state_mut()?.terms.decode_quad(quad)?;
+                    frame_quads = frame_quads.saturating_add(1);
+                    frame_bytes = frame_bytes.saturating_add(retained_term_bytes(&quad));
+                    check_frame_content(&quad_limits, frame_quads, frame_bytes)?;
                     let same_run = matches!(&pending, Some(batch) if batch.is_add == is_add);
                     if !same_run {
                         flush_pending(&mut pending, &mut ops)?;
-                        pending = Some(PendingBatch {
-                            is_add,
-                            builder: QuadBatchBuilder::new(self.options.quad_limits),
-                        });
+                        check_op_count(max_ops, ops.len().saturating_add(1))?;
                     }
-                    let batch = pending.as_mut().expect("pending batch ensured above");
+                    let batch = pending.get_or_insert_with(|| PendingBatch {
+                        is_add,
+                        builder: QuadBatchBuilder::with_capacity(quad_limits, RUN_BUILDER_CAPACITY),
+                    });
                     batch.builder.push(quad.as_ref(), None)?;
                 }
                 rdf_patch_row::Row::TransactionStart(_) => {
                     non_header_row_seen = true;
                     flush_pending(&mut pending, &mut ops)?;
+                    check_op_count(max_ops, ops.len().saturating_add(1))?;
                     let state = self.state_mut()?;
                     if state.in_transaction {
                         return Err(JellyError::Frame(
@@ -177,6 +246,7 @@ impl JellyPatchDecoder {
                 | rdf_patch_row::Row::TransactionAbort(_) => {
                     non_header_row_seen = true;
                     flush_pending(&mut pending, &mut ops)?;
+                    check_op_count(max_ops, ops.len().saturating_add(1))?;
                     let is_commit = matches!(row, rdf_patch_row::Row::TransactionCommit(_));
                     let state = self.state_mut()?;
                     if !state.in_transaction {
@@ -198,6 +268,7 @@ impl JellyPatchDecoder {
                             "header rows must occur at the start of the patch frame".into(),
                         ));
                     }
+                    check_op_count(max_ops, ops.len().saturating_add(1))?;
                     let state = self.state_mut()?;
                     ops.push(decode_header(&mut state.terms, header)?);
                 }
@@ -250,9 +321,13 @@ impl JellyPatchDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`JellyError::Frame`] when a transaction is still open; a
-    /// truncated patch must never pass for a complete one.
+    /// Returns [`JellyError::Frame`] when a transaction is still open (a
+    /// truncated patch must never pass for a complete one) or when an
+    /// earlier [`Self::decode_frame`] call failed.
     pub fn finish(&self) -> Result<(), JellyError> {
+        if self.failed {
+            return Err(JellyError::Frame(POISONED.into()));
+        }
         if self
             .state
             .as_ref()
@@ -375,6 +450,68 @@ impl JellyPatchDecoder {
         });
         Ok(())
     }
+}
+
+/// Refuses a frame whose statements, across all runs, exceed `limits`.
+fn check_frame_content(limits: &QuadLimits, quads: usize, bytes: usize) -> Result<(), JellyError> {
+    if quads > limits.max_quads {
+        return Err(JellyError::Quad(QuadError::ResourceLimit {
+            resource: QuadResource::Quads,
+            limit: limits.max_quads,
+            observed: quads,
+        }));
+    }
+    if bytes > limits.max_retained_term_bytes {
+        return Err(JellyError::Quad(QuadError::ResourceLimit {
+            resource: QuadResource::RetainedTermBytes,
+            limit: limits.max_retained_term_bytes,
+            observed: bytes,
+        }));
+    }
+    Ok(())
+}
+
+/// Bytes the quad contract retains for `quad`.
+///
+/// Mirrors the `max_retained_term_bytes` accounting of
+/// `QuadBatchBuilder::push`: lexical forms of every column, with a triple
+/// term counted as its serialized form.
+fn retained_term_bytes(quad: &Quad) -> usize {
+    let subject = match &quad.subject {
+        NamedOrBlankNode::NamedNode(node) => node.as_str().len(),
+        NamedOrBlankNode::BlankNode(node) => node.as_str().len(),
+    };
+    let object = match &quad.object {
+        Term::NamedNode(node) => node.as_str().len(),
+        Term::BlankNode(node) => node.as_str().len(),
+        Term::Literal(literal) => literal.value().len().saturating_add(
+            literal
+                .language()
+                .map_or_else(|| literal.datatype().as_str().len(), str::len),
+        ),
+        Term::Triple(triple) => encode_triple_term(Triple::as_ref(triple)).len(),
+    };
+    let graph = match &quad.graph_name {
+        GraphName::DefaultGraph => 0,
+        GraphName::NamedNode(node) => node.as_str().len(),
+        GraphName::BlankNode(node) => node.as_str().len(),
+    };
+    subject
+        .saturating_add(quad.predicate.as_str().len())
+        .saturating_add(object)
+        .saturating_add(graph)
+}
+
+/// Refuses a frame whose operation count would exceed `max_ops`.
+fn check_op_count(max_ops: usize, count: usize) -> Result<(), JellyError> {
+    if count > max_ops {
+        return Err(JellyError::ResourceLimit {
+            resource: JellyResource::PatchOps,
+            limit: u32::try_from(max_ops).unwrap_or(u32::MAX),
+            observed: u32::try_from(count).unwrap_or(u32::MAX),
+        });
+    }
+    Ok(())
 }
 
 /// Finishes a pending statement run into an add or delete operation.

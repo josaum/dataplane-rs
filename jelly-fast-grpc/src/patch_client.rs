@@ -145,6 +145,7 @@ impl JellyPatchClient {
         Ok(PatchOpSubscription {
             frames: response.into_inner(),
             decoder: JellyPatchDecoder::new(decoder_options),
+            ended: false,
         })
     }
 }
@@ -161,6 +162,8 @@ impl JellyPatchClient {
 pub struct PatchOpSubscription {
     frames: Streaming<RdfPatchFrame>,
     decoder: JellyPatchDecoder,
+    /// Set by the first error; the subscription has ended.
+    ended: bool,
 }
 
 impl PatchOpSubscription {
@@ -177,10 +180,27 @@ impl PatchOpSubscription {
     /// lagging subscribers) and [`JellyGrpcError::Codec`] when a relayed
     /// frame is not a valid continuation of the patch stream or the
     /// stream ends mid-transaction.
+    ///
+    /// The first error ends the subscription: every later call returns
+    /// `Ok(None)` without reading the stream, because the decoder's state
+    /// is undefined after a failed frame and later frames would decode into
+    /// wrong operations.
     pub async fn next_ops(&mut self) -> Result<Option<Vec<PatchOp>>, JellyGrpcError> {
+        if self.ended {
+            return Ok(None);
+        }
+        let result = self.next_ops_unchecked().await;
+        if result.is_err() {
+            self.ended = true;
+        }
+        result
+    }
+
+    async fn next_ops_unchecked(&mut self) -> Result<Option<Vec<PatchOp>>, JellyGrpcError> {
         match self.frames.message().await? {
             Some(frame) => Ok(Some(self.decoder.decode_frame(&frame)?)),
             None => {
+                self.ended = true;
                 self.decoder.finish()?;
                 Ok(None)
             }

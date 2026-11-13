@@ -98,7 +98,7 @@ pub(crate) fn signed_from_bytes(bytes: &[u8]) -> Result<i64, CborldError> {
             bytes.len()
         )));
     }
-    let negative = bytes[0] & 0x80 != 0;
+    let negative = bytes.first().is_some_and(|byte| byte & 0x80 != 0);
     let mut value: i64 = if negative { -1 } else { 0 };
     for byte in bytes {
         value = (value << 8) | i64::from(*byte);

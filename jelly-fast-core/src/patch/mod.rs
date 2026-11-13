@@ -73,7 +73,7 @@ mod encoder;
 use arrow_array::RecordBatch;
 use oxrdf::Term;
 
-pub use decoder::{JellyPatchDecoder, JellyPatchDecoderOptions};
+pub use decoder::{DEFAULT_MAX_PATCH_OPS_PER_FRAME, JellyPatchDecoder, JellyPatchDecoderOptions};
 pub use encoder::{
     DEFAULT_PATCH_ROWS_PER_FRAME, JellyPatchEncoder, JellyPatchEncoderOptions,
     PATCH_PROTOCOL_VERSION,
