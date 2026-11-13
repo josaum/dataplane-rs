@@ -274,7 +274,7 @@ HOLDS = [
     ("pyo3*", ">=0.30", "pyo3 0.30 drops abi3-py38, which quad-fast-py builds"),
     ("napi", ">=3", "the consumer shells load napi 2 builds"),
     ("napi-derive", ">=3", "napi-derive 3 needs the napi 3 runtime"),
-    ("arrow*", ">=59", "Arrow is pinned to the consumers' 58"),
+    ("arrow*", ">=59", "batches are stamped with Arrow 58, which downstream readers check"),
 ]
 
 

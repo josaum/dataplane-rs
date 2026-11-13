@@ -45,12 +45,14 @@ updates:
       - dependency-name: "napi-derive"
         versions:
           - ">=3"
-      # Arrow is pinned to the version the consumers use (Cargo.toml says
-      # why), the same version parsers-rs pins, so a new major is the
-      # consumers' move first. Unblocked when the consumers take the new
-      # major: move every Arrow pin in Cargo.toml together and show the IPC
-      # and Flight round-trip tests pass. The `arrow-major` group above stays,
-      # so that upgrade arrives whole.
+      # Every batch is stamped `dataplane.arrow_version = "58.3.0"`, which
+      # downstream readers check exactly (Cargo.toml and
+      # quad-fast-core/src/schema.rs say why), so a new Arrow major is theirs
+      # to take first. Patch and minor releases within 58 still arrive. Unblocked
+      # when the downstream readers accept the new major's stamp: move every
+      # Arrow pin and ARROW_VERSION together and show the IPC and Flight
+      # round-trip tests pass. The `arrow-major` group above stays, so that
+      # upgrade arrives whole.
       - dependency-name: "arrow*"
         versions:
           - ">=59"

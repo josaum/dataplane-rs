@@ -34,10 +34,15 @@ publish = false
 
 # Shared dependency versions for every crate in this workspace.
 #
-# `arrow*` is pinned exactly, to the same version the consumers already use
-# (and parsers-rs pins): an Arrow IPC payload written here must be readable
-# there without a conversion step. Move every Arrow pin together, and only
-# when the consumers move.
+# `arrow*` is pinned exactly, so every member builds against one Arrow
+# release; move the pins together. They may move within major 58 for fixes
+# (58.3.0 to 58.4.1 for RUSTSEC-2026-0442): the Arrow IPC format and the
+# schema quad-fast-core writes do not change within a major, so a payload
+# written here still reads downstream without conversion. What downstream
+# readers check is the `dataplane.arrow_version` stamp (ARROW_VERSION in
+# quad-fast-core/src/schema.rs), which stays "58.3.0" until they move; a new
+# Arrow major needs a decision about that stamp, and a test fails until one
+# is made.
 [workspace.dependencies]
 arrow = { version = "=58.4.1", features = ["ipc_compression"] }
 arrow-array = "=58.4.1"
