@@ -246,3 +246,19 @@ fn extended_profile_alias_bomb_is_refused_by_node_budget() {
         "refusal must not compose the bomb first"
     );
 }
+
+/// Mapping keys are not JSON-LD values: expansion does not count them, so
+/// the YAML composition budget must not either. A 220,000-node graph of
+/// `{@id, name}` maps (about 660,000 counted values) is accepted, as the
+/// same document is when given as JSON.
+#[test]
+fn large_flat_graph_is_not_refused_for_its_keys() {
+    let mut text = String::from("\"@graph\":\n");
+    for index in 0..220_000 {
+        text.push_str(&format!(
+            "  - \"@id\": http://example.com/n{index}\n    http://example.com/name: n{index}\n"
+        ));
+    }
+    let document = parse_yaml_ld(&text, &YamlLdOptions::default()).expect("keys are not charged");
+    assert_eq!(document["@graph"].as_array().map(Vec::len), Some(220_000));
+}

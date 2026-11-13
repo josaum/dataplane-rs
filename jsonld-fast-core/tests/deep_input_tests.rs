@@ -29,9 +29,14 @@ const CHILD_CASE: &str = "JSONLD_DEEP_CHILD_CASE";
 /// Runs `case` in a child process on a 256 KiB thread and fails when the
 /// child does not exit cleanly (a stack overflow aborts it).
 fn isolated(name: &str, case: fn()) {
+    isolated_on(name, SMALL_STACK, case);
+}
+
+/// [`isolated`] with an explicit thread stack size.
+fn isolated_on(name: &str, stack: usize, case: fn()) {
     if std::env::var(CHILD_CASE).as_deref() == Ok(name) {
         let handle = std::thread::Builder::new()
-            .stack_size(SMALL_STACK)
+            .stack_size(stack)
             .spawn(case)
             .expect("spawn the small-stack thread");
         handle.join().expect("the case must not panic");
@@ -509,4 +514,53 @@ fn long_flat_list_to_quads() {
         leak(round_tripped);
         leak(input);
     });
+}
+
+// ---------------------------------------------------------------------------
+// YAML aliases nest too: each alias composes a full copy of its anchor.
+// ---------------------------------------------------------------------------
+
+/// 100 anchors, each 120 flow levels deep around an alias of the previous
+/// one: about 25 KB that composes to roughly 12,000 levels.
+fn yaml_alias_depth_chain() -> String {
+    let mut text = String::new();
+    for anchor in 0..100 {
+        text.push_str(&format!("- &a{anchor} "));
+        text.push_str(&"[".repeat(120));
+        if anchor == 0 {
+            text.push('x');
+        } else {
+            text.push_str(&format!("*a{}", anchor - 1));
+        }
+        text.push_str(&"]".repeat(120));
+        text.push('\n');
+    }
+    text
+}
+
+fn refuse_yaml_alias_depth_chain() {
+    let options = YamlLdOptions {
+        profile: YamlLdProfile::Extended,
+        ..YamlLdOptions::default()
+    };
+    let error = parse_yaml_ld(&yaml_alias_depth_chain(), &options)
+        .expect_err("an alias chain composing past max_depth is refused");
+    println!("refused: {error}");
+}
+
+#[test]
+fn yaml_alias_depth_chain_small_stack() {
+    isolated(
+        "yaml_alias_depth_chain_small_stack",
+        refuse_yaml_alias_depth_chain,
+    );
+}
+
+#[test]
+fn yaml_alias_depth_chain_8_mib_stack() {
+    isolated_on(
+        "yaml_alias_depth_chain_8_mib_stack",
+        8 * 1024 * 1024,
+        refuse_yaml_alias_depth_chain,
+    );
 }
