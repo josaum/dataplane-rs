@@ -42,7 +42,7 @@ The Flight server reads `FLIGHT_REQUIRE_AUTH`, `FLIGHT_ALLOW_LEGACY_HS256`, `FLI
 - **Authentication only on the provided entry points.** `serve_with_verifier` and `bind_with_verifier` gate every RPC and refuse to start unless the verifier requires authentication with an issuer and audience; `serve`, `serve_with_limits` and `bind` authenticate nothing and bind only loopback. `QuadFlightService::new`, `JellyStreamService::new` and `JellyPatchStreamService::new` are public and unguarded: mounting them on your own tonic server skips authentication, the loopback rule, the message caps and every connection limit.
 - **No tenant scoping.** Any token carrying `flight:invoke` can read, drop or `reset` any dataset and publish or subscribe to any Jelly topic, whatever its `tenant_id`.
 - **Tokens are checked when a stream opens.** An open `DoGet`, `DoExchange`, subscription or publish stream outlives its token's expiry.
-- **The Flight store budget counts encoded wire bytes** (`FlightData` header plus body as received), not decoded Arrow memory. A dataset stays charged until its last `DoGet` reader is gone; a reader that takes no message for `idle_timeout` is cut off with `DEADLINE_EXCEEDED`.
+- **The Flight store budget counts encoded wire bytes** (`FlightData` header plus body as received, plus the uncompressed size any zstd buffer declares), not decoded Arrow memory. lz4-compressed ingest is refused. A dataset stays charged until its last `DoGet` reader is gone; a reader that takes no message for `idle_timeout` is cut off with `DEADLINE_EXCEEDED`.
 
 ---
 

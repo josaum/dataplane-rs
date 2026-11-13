@@ -16,8 +16,8 @@
 //!   open stream outlives the token's `exp`.
 //!
 //! The store byte budget counts encoded wire bytes (`FlightData` header plus
-//! body as received), and a dataset stays charged until its last reader is
-//! gone.
+//! body as received, plus the uncompressed size any zstd buffer declares),
+//! and a dataset stays charged until its last reader is gone.
 
 use std::{net::SocketAddr, time::Duration};
 
