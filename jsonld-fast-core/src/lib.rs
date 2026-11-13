@@ -136,8 +136,16 @@
 //! unoptimized builds (about 17 KiB per object level in expansion), so a
 //! document *within* the limit but deeper than a few levels is processed
 //! on a short-lived worker thread whose stack is sized from its measured
-//! depth; shallow documents run inline. The caller's stack size therefore
-//! never decides whether a legal document can be processed.
+//! depth; shallow documents run inline. Processing a legal document
+//! therefore does not depend on the caller's stack size. Two things still
+//! do, and are the caller's concern: a framed result can nest about three
+//! times its embed depth (up to about 3 × [`MAX_FRAME_EMBED_DEPTH`]
+//! levels), so expanding it again needs a `max_depth` above that; and
+//! dropping (or cloning, or comparing) a very deep returned
+//! [`serde_json::Value`] recurses on the caller's own stack, which in an
+//! unoptimized build overflows a small thread long before 6,000 levels.
+//! Where threads cannot be started (for example `wasm32`), input that needs
+//! a worker is refused with [`JsonLdError::WorkerUnavailable`].
 //!
 //! # Deliberate deviations (all fail closed)
 //!
@@ -243,6 +251,9 @@ pub fn parse_document(text: &str, limits: &JsonLdLimits) -> Result<Value, JsonLd
 ///
 /// Returns the typed [`JsonLdError`] raised by context processing, refused
 /// features, malformed documents, or an exceeded resource limit.
+///
+/// Input nested deeper than a few levels runs on a short-lived worker
+/// thread; [`JsonLdError::WorkerUnavailable`] when it cannot be started.
 pub fn expand(document: &Value, options: &JsonLdOptions) -> Result<Value, JsonLdError> {
     let depth = guard::check_nesting(document, options.limits.max_depth)?;
     guard::run_sized(depth, || expand::expand_document(document, options))
@@ -266,6 +277,9 @@ pub fn expand(document: &Value, options: &JsonLdOptions) -> Result<Value, JsonLd
 /// `context` (including [`JsonLdError::RemoteContextRefused`]), and
 /// [`JsonLdError::InvalidTerm`] for the API's `IRI confused with prefix`
 /// condition.
+///
+/// Input nested deeper than a few levels runs on a short-lived worker
+/// thread; [`JsonLdError::WorkerUnavailable`] when it cannot be started.
 pub fn compact(
     document: &Value,
     context: &Value,
@@ -301,9 +315,14 @@ pub fn compact(
 /// refused.
 ///
 /// Embedding is bounded by [`MAX_FRAME_EMBED_DEPTH`]. A framing that embeds
-/// more than a few levels deep is re-run on a short-lived worker thread
-/// whose stack is sized for that bound, so the caller's stack size does not
-/// limit it; the returned value can still nest that deep.
+/// more than a few levels deep is re-run from the start on a short-lived
+/// worker thread whose stack is sized for that bound, so the caller's
+/// stack does not limit framing itself. The returned value, however, can
+/// nest about three JSON levels per embed level: re-expanding it needs a
+/// [`JsonLdLimits::max_depth`] above that, and dropping a very deep result
+/// recurses on the caller's stack, which is the caller's concern in an
+/// unoptimized build. `@embed: @always` fan-out is charged against
+/// [`JsonLdLimits::max_nodes`] by design.
 ///
 /// # Errors
 ///
@@ -312,8 +331,9 @@ pub fn compact(
 /// [`JsonLdError::RemoteContextRefused`] for
 /// remote frame contexts, [`JsonLdError::ResourceLimit`] with
 /// [`JsonLdResource::EmbedDepth`] or [`JsonLdResource::Nodes`] when
-/// embedding exceeds its bounds, and every expansion and compaction error
-/// of the document and the frame.
+/// embedding exceeds its bounds, [`JsonLdError::WorkerUnavailable`] when a
+/// deep framing needs a worker thread that cannot be started, and every
+/// expansion and compaction error of the document and the frame.
 pub fn frame(
     document: &Value,
     frame: &Value,
@@ -339,6 +359,9 @@ pub fn frame(
 /// Returns expansion errors, [`JsonLdError::RelativeIri`] for IRIs that
 /// stayed relative, [`JsonLdError::InvalidTerm`] for unrepresentable terms,
 /// and [`JsonLdError::Quad`] when a quad-batch budget is exceeded.
+///
+/// Input nested deeper than a few levels runs on a short-lived worker
+/// thread; [`JsonLdError::WorkerUnavailable`] when it cannot be started.
 pub fn to_quads(
     document: &Value,
     options: &JsonLdOptions,

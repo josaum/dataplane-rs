@@ -26,6 +26,12 @@ use crate::error::{JsonLdError, JsonLdResource};
 /// The scan runs in time linear in the number of containers and uses heap
 /// memory proportional to the widest pending frontier, never native stack.
 ///
+/// It is deliberately structural: containers inside `@context`, and under
+/// keys that expansion would later drop, count too, because `clone`,
+/// `Drop`, and context processing recurse into them as well. JSON *text*
+/// is unaffected in practice, since `serde_json` already stops parsing at
+/// 128 levels, the default limit; only values built in code can exceed it.
+///
 /// # Errors
 ///
 /// [`JsonLdError::ResourceLimit`] with [`JsonLdResource::Depth`], reporting
@@ -90,7 +96,8 @@ const MAX_WORKER_STACK: usize = 1 << 30;
 ///
 /// `job`'s own error; [`JsonLdError::ResourceLimit`] with
 /// [`JsonLdResource::Depth`] when `depth` needs more than
-/// [`MAX_WORKER_STACK`] or the worker cannot be spawned.
+/// [`MAX_WORKER_STACK`] (the limit reported is the depth that fits);
+/// [`JsonLdError::WorkerUnavailable`] when the worker cannot be spawned.
 pub(crate) fn run_sized<T, F>(depth: usize, job: F) -> Result<T, JsonLdError>
 where
     T: Send,
@@ -100,13 +107,12 @@ where
         return job();
     }
     let max_levels = MAX_WORKER_STACK.saturating_sub(WORKER_BASE_STACK) / STACK_PER_LEVEL;
-    let refused = JsonLdError::ResourceLimit {
-        resource: JsonLdResource::Depth,
-        limit: max_levels,
-        observed: depth,
-    };
     if depth > max_levels {
-        return Err(refused);
+        return Err(JsonLdError::ResourceLimit {
+            resource: JsonLdResource::Depth,
+            limit: max_levels,
+            observed: depth,
+        });
     }
     let stack_bytes = depth
         .saturating_mul(STACK_PER_LEVEL)
@@ -119,7 +125,7 @@ where
         // No worker stack: refuse rather than recurse on a caller stack
         // that was never sized for this depth.
         let Ok(handle) = spawned else {
-            return Err(refused);
+            return Err(JsonLdError::WorkerUnavailable { stack_bytes, depth });
         };
         match handle.join() {
             Ok(result) => result,

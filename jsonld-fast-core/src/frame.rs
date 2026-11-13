@@ -196,12 +196,11 @@ fn run_on_worker(run: &FramingRun<'_>) -> Result<Value, JsonLdError> {
             .stack_size(stack_bytes)
             .spawn_scoped(scope, || run.execute(MAX_FRAME_EMBED_DEPTH));
         let Ok(handle) = spawned else {
-            // No worker stack: refuse the depth rather than recurse on a
-            // caller stack that was never sized for it.
-            return Err(JsonLdError::ResourceLimit {
-                resource: JsonLdResource::EmbedDepth,
-                limit: INLINE_EMBED_DEPTH,
-                observed: INLINE_EMBED_DEPTH.saturating_add(1),
+            // No worker stack: refuse rather than recurse on a caller
+            // stack that was never sized for this embed depth.
+            return Err(JsonLdError::WorkerUnavailable {
+                stack_bytes,
+                depth: INLINE_EMBED_DEPTH.saturating_add(1),
             });
         };
         match handle.join() {
@@ -613,7 +612,9 @@ fn frame_subjects_inner(
 /// whose nodes each reference the next one twice frames to an output
 /// exponential in its size. Every embedded node is charged its value count
 /// against [`crate::JsonLdLimits::max_nodes`], and embed nesting against
-/// the run's cap, before the copy is made.
+/// the run's cap, before the copy is made. This is an intended limit:
+/// legitimate `@always` fan-out that copies more than `max_nodes` values in
+/// total is refused too; raise `max_nodes` to frame it.
 fn charge_embed(
     state: &mut FramingState<'_>,
     node: &Map<String, Value>,

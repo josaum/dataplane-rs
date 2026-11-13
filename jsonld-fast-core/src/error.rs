@@ -181,6 +181,23 @@ pub enum JsonLdError {
     /// YAML composition or JSON conversion failed (`loading-document-failed`).
     #[error("loading_document_failed: {0}")]
     YamlLoadFailed(String),
+    /// A worker thread for deep input could not be started.
+    ///
+    /// Inputs nested (or framed) deeper than the inline threshold are
+    /// processed on a short-lived thread whose stack is sized for their
+    /// depth. Where threads are unavailable (for example `wasm32`) or the
+    /// address space is capped, the spawn fails and the input is refused
+    /// rather than recursed on a stack that was never sized for it.
+    #[error(
+        "worker_unavailable: could not start a worker thread with a {stack_bytes}-byte stack \
+         for depth {depth}"
+    )]
+    WorkerUnavailable {
+        /// Stack size requested for the worker, in bytes.
+        stack_bytes: usize,
+        /// Nesting (or embed) depth that needed the worker.
+        depth: usize,
+    },
     /// The underlying quad contract rejected an operation.
     #[error("quad: {0}")]
     Quad(#[from] QuadError),
@@ -207,6 +224,7 @@ impl JsonLdError {
             Self::YamlMappingKey(_) => "mapping_key_error",
             Self::YamlProfile(_) => "profile_error",
             Self::YamlLoadFailed(_) => "loading_document_failed",
+            Self::WorkerUnavailable { .. } => "worker_unavailable",
             Self::Quad(_) => "quad",
         }
     }
