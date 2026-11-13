@@ -33,6 +33,10 @@
 //! `kind: "triple"` on input is an `input:` error, and a decoded batch
 //! carrying one raises `unsupported: rdf12_triple_term` — never flattened
 //! into a node reference.
+//!
+//! Every exported function is built with `#[napi(catch_unwind)]`: a Rust panic
+//! inside a call becomes a thrown JS `Error` instead of unwinding across the
+//! `extern "C"` boundary, which aborts the whole Node process.
 
 mod convert;
 #[cfg(test)]
@@ -57,7 +61,7 @@ fn err(error: convert::BindingError) -> Error {
 }
 
 /// Crate / binding version string.
-#[napi]
+#[napi(catch_unwind)]
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -67,7 +71,7 @@ pub fn version() -> &'static str {
 ///
 /// `options` (all optional, unknown keys rejected): `maxQuads`,
 /// `maxRetainedTermBytes`, `maxIpcBytes`.
-#[napi]
+#[napi(catch_unwind)]
 pub fn quads_to_ipc(quads: Value, options: Option<Value>) -> Result<Buffer> {
     convert::quads_to_ipc(&quads, options.as_ref())
         .map(Buffer::from)
@@ -79,7 +83,7 @@ pub fn quads_to_ipc(quads: Value, options: Option<Value>) -> Result<Buffer> {
 /// `options` (all optional, unknown keys rejected): `maxQuads` (cumulative
 /// decoded-quad budget), `maxRetainedTermBytes`, `maxIpcBytes` (input byte
 /// budget).
-#[napi]
+#[napi(catch_unwind)]
 pub fn ipc_to_quads(ipc: Buffer, options: Option<Value>) -> Result<Value> {
     convert::ipc_to_quads(&ipc, options.as_ref()).map_err(err)
 }
@@ -92,7 +96,7 @@ pub fn ipc_to_quads(ipc: Buffer, options: Option<Value>) -> Result<Value> {
 /// `maxNameTableSize`, `maxDatatypeTableSize`, `quadsPerFrame`,
 /// `allowProvenanceLoss` (Jelly has no provenance fields; without this flag,
 /// quads carrying provenance are refused rather than silently stripped).
-#[napi]
+#[napi(catch_unwind)]
 pub fn quads_to_jelly_frames(quads: Value, options: Option<Value>) -> Result<Buffer> {
     convert::quads_to_jelly_frames(&quads, options.as_ref())
         .map(Buffer::from)
@@ -105,7 +109,22 @@ pub fn quads_to_jelly_frames(quads: Value, options: Option<Value>) -> Result<Buf
 /// cumulative decoded-quad budget), `maxRetainedTermBytes`,
 /// `maxPrefixTableSize`, `maxNameTableSize`, `maxDatatypeTableSize`,
 /// `maxInputBytes`, `maxFrames`.
-#[napi]
+#[napi(catch_unwind)]
 pub fn jelly_frames_to_quads(frames: Buffer, options: Option<Value>) -> Result<Value> {
     convert::jelly_frames_to_quads(&frames, options.as_ref()).map_err(err)
+}
+
+/// Panics on purpose, so a test can prove a panic surfaces as a JS `Error`.
+///
+/// Compiled only with the `panic-probe` feature, which no release enables.
+/// `panic.test.mjs` calls it in a child process and requires the call to throw
+/// while the process exits normally.
+///
+/// # Panics
+///
+/// Always, with the message `panic-probe: deliberate panic`.
+#[cfg(feature = "panic-probe")]
+#[napi(catch_unwind)]
+pub fn panic_probe() {
+    panic!("panic-probe: deliberate panic");
 }

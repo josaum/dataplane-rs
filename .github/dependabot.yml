@@ -1,0 +1,88 @@
+# Weekly dependency updates, one entry per ecosystem with a manifest in the
+# repository. For cargo, minor and patch updates arrive together and each
+# major arrives in a pull request of its own, so it can be judged on its own.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    # The workspace root: one Cargo.lock resolves every member crate.
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      cargo-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+      # The Arrow crates share one exact version (Cargo.toml says why), so a
+      # new major moves all of them in one pull request.
+      arrow-major:
+        patterns:
+          - "arrow"
+          - "arrow-*"
+        update-types:
+          - major
+    ignore:
+      # pyo3 0.30 drops `abi3-py38`. The wheels are built for Python 3.8 and
+      # later, so that upgrade waits for a decision to raise the floor.
+      - dependency-name: "pyo3*"
+        versions:
+          - ">=0.30"
+      # napi-derive 3 generates code only the napi 3 runtime accepts, so the
+      # two move together or not at all. The workspace keeps napi 2 because
+      # the consumer shells load the `.node` files it builds, the same shells
+      # that load parsers-rs's, which holds napi 2 for the same reason.
+      # quad-fast-node has not been tried on napi 3. Unblocked when the
+      # consumer shells accept a napi 3 build and quad-fast-node's
+      # smoke.test.mjs, panic.test.mjs and scripts/smoke-node.mjs pass on it.
+      - dependency-name: "napi"
+        versions:
+          - ">=3"
+      - dependency-name: "napi-derive"
+        versions:
+          - ">=3"
+      # Every batch is stamped `dataplane.arrow_version = "58.3.0"`, which
+      # downstream readers check exactly (Cargo.toml and
+      # quad-fast-core/src/schema.rs say why), so a new Arrow major is theirs
+      # to take first. Patch and minor releases within 58 still arrive. Unblocked
+      # when the downstream readers accept the new major's stamp: move every
+      # Arrow pin and ARROW_VERSION together and show the IPC and Flight
+      # round-trip tests pass. The `arrow-major` group above stays, so that
+      # upgrade arrives whole.
+      - dependency-name: "arrow*"
+        versions:
+          - ">=59"
+
+  - package-ecosystem: github-actions
+    # Every action is pinned by commit SHA with its version in a trailing
+    # comment; Dependabot moves both.
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+      include: scope
+
+  - package-ecosystem: uv
+    # quad-fast-py's uv.lock, which pins what pyproject.toml asks for (pyarrow
+    # and the test group); `uv run` in CI installs from it. Nothing there is
+    # managed by pip.
+    directory: /quad-fast-py
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+
+  - package-ecosystem: npm
+    # quad-fast-node's package.json.
+    directory: /quad-fast-node
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope

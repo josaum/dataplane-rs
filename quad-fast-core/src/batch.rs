@@ -162,4 +162,70 @@ mod tests {
             .expect_err("extra metadata keys are contract-checked");
         assert_eq!(error.code(), "contract");
     }
+
+    /// The workspace manifest, which pins every Arrow crate.
+    const WORKSPACE_MANIFEST: &str =
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../Cargo.toml"));
+
+    /// The major of the exact `arrow-ipc` pin in a workspace manifest.
+    fn pinned_arrow_ipc_major(manifest: &str) -> Option<&str> {
+        let line = manifest
+            .lines()
+            .find(|line| line.trim_start().starts_with("arrow-ipc ="))?;
+        let version = line.split("\"=").nth(1)?.split('"').next()?;
+        version.split('.').next()
+    }
+
+    /// Checks that the stamp names the same Arrow major as the pin.
+    fn stamp_follows_pin(stamp: &str, manifest: &str) -> Result<(), String> {
+        let pin = pinned_arrow_ipc_major(manifest)
+            .ok_or_else(|| "no exact `arrow-ipc = \"=X.Y.Z\"` pin in the manifest".to_owned())?;
+        let stamp_major = stamp.split('.').next().unwrap_or_default();
+        if stamp_major == pin {
+            Ok(())
+        } else {
+            Err(format!(
+                "the workspace pins Arrow {pin} but batches are stamped \
+                 dataplane.arrow_version = {stamp:?}: decide the stamp for the new major \
+                 with the downstream readers that check it exactly (see ARROW_VERSION in \
+                 src/schema.rs)"
+            ))
+        }
+    }
+
+    #[test]
+    fn arrow_version_stamp_follows_the_pinned_arrow_major() {
+        let batch = finished_batch();
+        let stamp = batch
+            .schema()
+            .metadata()
+            .get("dataplane.arrow_version")
+            .cloned()
+            .expect("every batch carries the stamp");
+        assert_eq!(
+            stamp, "58.3.0",
+            "dataplane.arrow_version is a wire contract that downstream readers check \
+             exactly; it changes only in step with them (see ARROW_VERSION in src/schema.rs)"
+        );
+        if let Err(message) = stamp_follows_pin(&stamp, WORKSPACE_MANIFEST) {
+            panic!("{message}");
+        }
+    }
+
+    #[test]
+    fn the_stamp_check_refuses_a_new_arrow_major() {
+        let next_major = WORKSPACE_MANIFEST.replace(
+            "arrow-ipc = { version = \"=58.",
+            "arrow-ipc = { version = \"=59.",
+        );
+        assert_ne!(
+            next_major, WORKSPACE_MANIFEST,
+            "the arrow-ipc pin must be found"
+        );
+        let error =
+            stamp_follows_pin("58.3.0", &next_major).expect_err("Arrow 59 needs a stamp decision");
+        assert!(error.contains("pins Arrow 59"), "{error}");
+        assert!(stamp_follows_pin("58.3.0", "[workspace.dependencies]\n").is_err());
+        assert!(stamp_follows_pin("59.0.0", WORKSPACE_MANIFEST).is_err());
+    }
 }

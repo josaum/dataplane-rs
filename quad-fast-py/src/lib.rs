@@ -39,6 +39,13 @@
 //!
 //! The conversion logic lives in [`convert`], which is pure Rust and unit
 //! tested without a Python interpreter (see `src/tests.rs`).
+//!
+//! Every call runs its encoding and decoding with the GIL released
+//! (`Python::detach`), so other Python threads keep running during a long
+//! call; only the conversion to and from Python objects holds it. A Rust
+//! panic inside a call is caught by PyO3 at the function boundary and raised
+//! as `pyo3_runtime.PanicException`; the workspace never builds with
+//! `panic = "abort"`, which would turn it into a process abort.
 
 use jelly_fast_core::{JellyDecoderOptions, JellyEncoderOptions};
 use jsonld_fast_core::JsonLdLimits;
@@ -227,19 +234,18 @@ fn build_quad_ipc(
         .enumerate()
         .map(|(index, item)| quad_from_py(index, item))
         .collect::<PyResult<Vec<_>>>()?;
-    let payload = convert::quads_to_ipc(
-        &specs,
-        quad_limits(max_quads, max_retained_term_bytes),
-        max_ipc_bytes.unwrap_or(quad_fast_core::DEFAULT_MAX_IPC_BYTES),
-    )
-    .map_err(binding_err)?;
+    let limits = quad_limits(max_quads, max_retained_term_bytes);
+    let max_ipc_bytes = max_ipc_bytes.unwrap_or(quad_fast_core::DEFAULT_MAX_IPC_BYTES);
+    let payload = py
+        .detach(|| convert::quads_to_ipc(&specs, limits, max_ipc_bytes))
+        .map_err(binding_err)?;
     Ok(PyBytes::new(py, &payload).unbind())
 }
 
 /// Decodes `UnsignedQuadStream` Arrow IPC bytes into quad tuples.
 #[pyfunction]
 fn read_quad_ipc(py: Python<'_>, data: &[u8]) -> PyResult<Vec<PyQuadOut>> {
-    convert::ipc_to_quads(data)
+    py.detach(|| convert::ipc_to_quads(data))
         .map_err(binding_err)?
         .into_iter()
         .map(|spec| quad_to_py(py, spec))
@@ -296,14 +302,19 @@ fn jsonld_to_quad_ipc(
     if let Some(value) = max_depth {
         limits.max_depth = value;
     }
-    let payload = convert::jsonld_to_ipc(
-        text,
-        provenance.as_ref(),
-        &limits,
-        quad_limits(max_quads, max_retained_term_bytes),
-        max_ipc_bytes.unwrap_or(quad_fast_core::DEFAULT_MAX_IPC_BYTES),
-    )
-    .map_err(binding_err)?;
+    let quad_limits = quad_limits(max_quads, max_retained_term_bytes);
+    let max_ipc_bytes = max_ipc_bytes.unwrap_or(quad_fast_core::DEFAULT_MAX_IPC_BYTES);
+    let payload = py
+        .detach(|| {
+            convert::jsonld_to_ipc(
+                text,
+                provenance.as_ref(),
+                &limits,
+                quad_limits,
+                max_ipc_bytes,
+            )
+        })
+        .map_err(binding_err)?;
     Ok(PyBytes::new(py, &payload).unbind())
 }
 
@@ -350,7 +361,9 @@ fn jelly_encode(
     if let Some(value) = quads_per_frame {
         options.quads_per_frame = value;
     }
-    let frames = convert::ipc_to_jelly_frames(data, options).map_err(binding_err)?;
+    let frames = py
+        .detach(|| convert::ipc_to_jelly_frames(data, options))
+        .map_err(binding_err)?;
     Ok(frames
         .into_iter()
         .map(|frame| PyBytes::new(py, &frame).unbind())
@@ -396,13 +409,29 @@ fn jelly_decode(
     if let Some(value) = max_datatype_table_size {
         options.max_datatype_table_size = value;
     }
-    let payload = convert::jelly_frames_to_ipc(
-        &frames,
-        options,
-        max_ipc_bytes.unwrap_or(quad_fast_core::DEFAULT_MAX_IPC_BYTES),
-    )
-    .map_err(binding_err)?;
+    let max_ipc_bytes = max_ipc_bytes.unwrap_or(quad_fast_core::DEFAULT_MAX_IPC_BYTES);
+    let payload = py
+        .detach(|| convert::jelly_frames_to_ipc(&frames, options, max_ipc_bytes))
+        .map_err(binding_err)?;
     Ok(PyBytes::new(py, &payload).unbind())
+}
+
+/// Panics on purpose, so a test can prove a panic surfaces as an exception.
+///
+/// Compiled only with the `panic-probe` feature, which no release enables.
+/// The panic happens with the GIL released, as the real calls do their work,
+/// so the test covers the path from `py.detach` back to the function boundary.
+/// `tests/test_panic.py` calls it in a child interpreter and requires
+/// `pyo3_runtime.PanicException` while the process exits normally.
+///
+/// # Panics
+///
+/// Always, with the message `panic-probe: deliberate panic`.
+#[cfg(feature = "panic-probe")]
+#[pyfunction]
+#[pyo3(name = "_panic_probe")]
+fn panic_probe(py: Python<'_>) {
+    py.detach(|| panic!("panic-probe: deliberate panic"))
 }
 
 /// Registers the `quad_fast._native` extension module.
@@ -417,5 +446,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(jelly_encode, module)?)?;
     module.add_function(wrap_pyfunction!(jelly_decode, module)?)?;
     module.add_function(wrap_pyfunction!(jsonld_to_quad_ipc, module)?)?;
+    #[cfg(feature = "panic-probe")]
+    module.add_function(wrap_pyfunction!(panic_probe, module)?)?;
     Ok(())
 }

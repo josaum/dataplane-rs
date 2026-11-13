@@ -22,11 +22,23 @@ pub const CONTRACT_NAME: &str = "UnsignedQuadStream";
 /// [`crate::quoted`] for the full rationale.
 pub const CONTRACT_VERSION: &str = "1";
 
-/// Arrow major.minor.patch this contract is pinned to.
+/// Arrow contract version stamped into every batch as `dataplane.arrow_version`.
 ///
-/// Must match the workspace pin and the `dataplane.arrow_version` used by
-/// downstream contracts so IPC payloads stay byte-compatible across
-/// planes.
+/// This names the Arrow contract that downstream readers validate, not the
+/// Arrow patch release that wrote the batch. Downstream readers that check
+/// this value exactly refuse a batch carrying any other one, and
+/// [`validate_contract`] does the same here.
+///
+/// The workspace Arrow pin may move within the same major for fixes (it moved
+/// from 58.3.0 to 58.4.1 for RUSTSEC-2026-0442) without touching this value:
+/// the Arrow IPC format and the schema this crate writes do not change within
+/// a major. A new Arrow major needs a deliberate decision about this value;
+/// the test `arrow_version_stamp_follows_the_pinned_arrow_major` fails until
+/// one is made.
+///
+/// Changing the value is a coordinated change with the downstream readers
+/// that check it exactly: they must accept the new value before a batch
+/// carrying it is written.
 const ARROW_VERSION: &str = "58.3.0";
 
 /// Term kind marker for IRIs.

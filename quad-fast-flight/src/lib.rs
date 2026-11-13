@@ -2,7 +2,7 @@
 //! Arrow Flight transport for unsigned quad datasets.
 //!
 //! This crate exposes an in-memory store of RDF quad datasets over Arrow
-//! Flight (`arrow-flight` 58.3.0 on `tonic` 0.14). The only payload on any
+//! Flight (`arrow-flight` 58.4.1 on `tonic` 0.14). The only payload on any
 //! RPC is the `UnsignedQuadStream` v1 Arrow contract from [`quad_fast_core`]:
 //! ingest validates the contract on every incoming schema and record batch
 //! and rejects non-conforming payloads with `INVALID_ARGUMENT`, so a batch

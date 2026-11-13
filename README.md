@@ -28,7 +28,7 @@ Every repository in the sovereign workspace ecosystem lives under `https://githu
 
 1. **Deterministic & Fail-Closed**: No unbudgeted recursion, no silent error dropping, and no dynamic network resolution without explicit opt-in.
 2. **Cryptographic Provenance**: Every artifact is stamped into `release-manifest.json` with its SHA-256 digest, exact Git commit, and author signature (`Dionisio Chiuratto Agourakis`).
-3. **Pinned Arrow Wire Format**: All workspace members share an exact Apache Arrow wire pin (`arrow = "=58.3.0"`, `arrow-array = "=58.3.0"`, `arrow-buffer = "=58.3.0"`, `arrow-ipc = "=58.3.0"`, `arrow-schema = "=58.3.0"`, `arrow-flight = "=58.3.0"`).
+3. **Pinned Arrow Wire Format**: Every batch is stamped `dataplane.arrow_version = "58.3.0"`, the Arrow contract version that downstream readers check exactly; it changes only in step with them. The library pin is separate: all workspace members build against one exact Arrow release (`arrow`, `arrow-array`, `arrow-ipc`, `arrow-schema`, `arrow-flight` at `=58.4.1`), which may move within major 58 for fixes because the IPC format and the contract schema do not change within a major. A new Arrow major needs a decision about the stamp first; `arrow_version_stamp_follows_the_pinned_arrow_major` in quad-fast-core fails until one is made.
 4. **Strict Namespace**: Managed under `fast-parser-inc/` (`https://github.com/fast-parser-inc/dataplane-rs`).
 
 

@@ -32,13 +32,23 @@ repository = "https://github.com/fast-parser-inc/dataplane-rs"
 rust-version = "1.94"
 publish = false
 
+# Shared dependency versions for every crate in this workspace.
+#
+# `arrow*` is pinned exactly, so every member builds against one Arrow
+# release; move the pins together. They may move within major 58 for fixes
+# (58.3.0 to 58.4.1 for RUSTSEC-2026-0442): the Arrow IPC format and the
+# schema quad-fast-core writes do not change within a major, so a payload
+# written here still reads downstream without conversion. What downstream
+# readers check is the `dataplane.arrow_version` stamp (ARROW_VERSION in
+# quad-fast-core/src/schema.rs), which stays "58.3.0" until they move; a new
+# Arrow major needs a decision about that stamp, and a test fails until one
+# is made.
 [workspace.dependencies]
-arrow = { version = "=58.3.0", features = ["ipc_compression"] }
-arrow-array = "=58.3.0"
-arrow-buffer = "=58.3.0"
-arrow-flight = "=58.3.0"
-arrow-ipc = { version = "=58.3.0", features = ["lz4", "zstd"] }
-arrow-schema = "=58.3.0"
+arrow = { version = "=58.4.1", features = ["ipc_compression"] }
+arrow-array = "=58.4.1"
+arrow-flight = "=58.4.1"
+arrow-ipc = { version = "=58.4.1", features = ["lz4", "zstd"] }
+arrow-schema = "=58.4.1"
 bytes = "1"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 futures = "0.3"
@@ -57,7 +67,7 @@ tonic-prost-build = "0.14.2"
 napi = { version = "2.16", features = ["serde-json"] }
 napi-derive = "2.16"
 napi-build = "2.2"
-pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py38"] }
+pyo3 = { version = "0.29.3", features = ["extension-module", "abi3-py38"] }
 
 quad-fast-core = { path = "quad-fast-core" }
 jelly-fast-core = { path = "jelly-fast-core" }
