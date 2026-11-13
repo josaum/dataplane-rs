@@ -323,10 +323,14 @@ fn reassemble_lists(
             // `rdf:first` of a node kept as triples may reference a
             // converted list head; substituting it there keeps the head's
             // items, which are otherwise removed with the consumed chain.
+            // `rdf:rest` of a node that is not a well-formed list node
+            // (extra properties, several `rdf:first`) may point at a
+            // well-formed tail: JSON-LD 1.1 API section 8.4.2 step 6.4
+            // replaces that reference with the tail's `@list`. A converted
+            // head is never the `rdf:rest` target of a list node, so this
+            // touches only such malformed nodes.
             let is_first = predicate == RDF_FIRST;
-            if predicate == RDF_REST {
-                continue;
-            }
+            let is_rest = predicate == RDF_REST;
             for value in values {
                 let Some(id) = value_id(value) else {
                     continue;
@@ -334,7 +338,7 @@ fn reassemble_lists(
                 if let Some((list, size)) = replacements.get(id) {
                     budget.use_list(id, *size)?;
                     *value = list.clone();
-                } else if id == RDF_NIL && !is_first {
+                } else if id == RDF_NIL && !is_first && !is_rest {
                     *value = empty_list();
                 }
             }
@@ -363,13 +367,11 @@ fn keep_unreferenced_lists(
     for (id, node) in nodes {
         let in_chain = consumed.contains(id);
         for (predicate, values) in &node.properties {
-            // Outside a chain any property can hold a list; inside one only
-            // `rdf:first` (a nested list item) can.
-            let holds_items = if in_chain {
-                predicate == RDF_FIRST
-            } else {
-                predicate != RDF_REST
-            };
+            // Outside a chain any property can hold a list (including the
+            // `rdf:rest` of a malformed list node, which points at a
+            // well-formed tail); inside one only `rdf:first` (a nested list
+            // item) can.
+            let holds_items = !in_chain || predicate == RDF_FIRST;
             if !holds_items {
                 continue;
             }

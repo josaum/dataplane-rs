@@ -12,7 +12,8 @@ use serde_json::{Map, Value};
 
 /// Tests this processor passes today; each must keep passing.
 const PINNED: &[&str] = &[
-    "0001", "0004", "0005", "0010", "0012", "0015", "0016", "0022", "0023", "li02",
+    "0001", "0004", "0005", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0022", "0023",
+    "li02",
 ];
 
 /// Normalizes blank node labels and the order of unordered arrays.
