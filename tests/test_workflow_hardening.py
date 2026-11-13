@@ -10,7 +10,8 @@ a mutated copy that must fail it:
 - cargo-deny and cargo-audit run, at pinned versions, in a workflow that runs
   on every push to main and every pull request, and that release.yml does not
   call;
-- Dependabot updates every ecosystem that has a manifest in the repository.
+- Dependabot updates every ecosystem that has a manifest in the repository,
+  and holds the upgrades the consumers cannot take yet (pyo3 0.30, napi 3).
 
 Structure is read with PyYAML. A `uses:` line is also read as text, because
 the version comment after a pinned SHA is invisible to a YAML parser.
@@ -230,11 +231,13 @@ def present_ecosystems(root: Path) -> set[tuple[str, str]]:
     found = {("cargo", "/")} if (root / "Cargo.toml").is_file() else set()
     if any((root / ".github/workflows").glob("*.y*ml")):
         found.add(("github-actions", "/"))
-    for path in root.rglob("pyproject.toml"):
+    # A uv.lock is what pins a Python project's dependencies; without one,
+    # pip reads the pyproject.toml or requirements file.
+    for path in root.rglob("uv.lock"):
         if tracked(path):
-            found.add(("pip", directory(path)))
-    for path in root.rglob("requirements*.txt"):
-        if tracked(path):
+            found.add(("uv", directory(path)))
+    for path in [*root.rglob("pyproject.toml"), *root.rglob("requirements*.txt")]:
+        if tracked(path) and not (path.parent / "uv.lock").is_file():
             found.add(("pip", directory(path)))
     for path in root.rglob("package.json"):
         if tracked(path):
@@ -256,6 +259,46 @@ def assert_dependabot_contract(dependabot: str, ecosystems: set[tuple[str, str]]
             covered.add((update.get("package-ecosystem"), entry))
     missing = ecosystems - covered
     assert not missing, f"Dependabot does not update {sorted(missing)}"
+    assert_dependabot_holds(document)
+
+
+# Upgrades Dependabot must not propose, each held for as long as its reason
+# holds in the manifests: (dependency-name, version range, reason).
+HOLDS = [
+    ("pyo3*", ">=0.30", "pyo3 0.30 drops abi3-py38, which quad-fast-py builds"),
+    ("napi", ">=3", "the consumer shells load napi 2 builds"),
+    ("napi-derive", ">=3", "napi-derive 3 needs the napi 3 runtime"),
+]
+
+
+def held_reasons() -> set[str]:
+    """The holds whose reason is still true of the manifests."""
+    python = tomllib.loads(read(ROOT / "quad-fast-py/Cargo.toml"))
+    node = tomllib.loads(read(ROOT / "quad-fast-node/Cargo.toml"))
+    reasons = set()
+    pyo3 = python["dependencies"].get("pyo3", {})
+    if "abi3-py38" in pyo3.get("features", []):
+        reasons.add("pyo3*")
+    napi = node["dependencies"].get("napi", {})
+    napi = napi.get("version", "") if isinstance(napi, dict) else napi
+    if napi.split(".")[0] == "2":
+        reasons.update({"napi", "napi-derive"})
+    return reasons
+
+
+def assert_dependabot_holds(document: dict) -> None:
+    cargo = [u for u in document.get("updates") or [] if u.get("package-ecosystem") == "cargo"]
+    assert cargo, "Dependabot has no cargo entry"
+    ignored = {
+        entry.get("dependency-name"): entry.get("versions") or []
+        for update in cargo
+        for entry in update.get("ignore") or []
+    }
+    for name, versions, reason in HOLDS:
+        if name in held_reasons():
+            assert ignored.get(name) == [versions], (
+                f"Dependabot must hold {name} {versions} ({reason}); it ignores {ignored.get(name)}"
+            )
 
 
 # --- the repository passes every contract ------------------------------------
@@ -290,7 +333,7 @@ def test_deny_and_audit_run_and_cannot_block_a_release():
 
 def test_dependabot_covers_every_ecosystem_present():
     ecosystems = present_ecosystems(ROOT)
-    assert {"cargo", "github-actions", "pip", "npm"} <= {name for name, _ in ecosystems}
+    assert {"cargo", "github-actions", "uv", "npm"} <= {name for name, _ in ecosystems}
     assert_dependabot_contract(read(DEPENDABOT), ecosystems)
 
 
@@ -302,10 +345,17 @@ def test_the_ecosystem_scan_finds_a_new_manifest(tmp_path: Path):
     (tmp_path / "web/package.json").write_text("{}")
     (tmp_path / "web/node_modules/dep").mkdir(parents=True)
     (tmp_path / "web/node_modules/dep/package.json").write_text("{}")
+    (tmp_path / "locked").mkdir()
+    (tmp_path / "locked/pyproject.toml").write_text("[project]\n")
+    (tmp_path / "locked/uv.lock").write_text("version = 1\n")
+    (tmp_path / "plain").mkdir()
+    (tmp_path / "plain/requirements.txt").write_text("pytest\n")
     assert present_ecosystems(tmp_path) == {
         ("cargo", "/"),
         ("github-actions", "/"),
         ("npm", "/web"),
+        ("uv", "/locked"),
+        ("pip", "/plain"),
     }
 
 
@@ -389,7 +439,11 @@ MUTATIONS = [
     ),
     # 4. Dependabot
     (dependabot, DEPENDABOT, "package-ecosystem: npm", "package-ecosystem: bundler"),
-    (dependabot, DEPENDABOT, "package-ecosystem: pip", "package-ecosystem: uv-not-pip"),
+    (dependabot, DEPENDABOT, "package-ecosystem: uv", "package-ecosystem: pip"),
+    (dependabot, DEPENDABOT, '- dependency-name: "pyo3*"', '- dependency-name: "pyo3-ffi"'),
+    (dependabot, DEPENDABOT, '- ">=0.30"', '- ">=0.31"'),
+    (dependabot, DEPENDABOT, '- dependency-name: "napi"\n', '- dependency-name: "napi-sys"\n'),
+    (dependabot, DEPENDABOT, '- dependency-name: "napi-derive"', '- dependency-name: "napi-build"'),
     (dependabot, DEPENDABOT, "package-ecosystem: github-actions", "package-ecosystem: docker"),
     (dependabot, DEPENDABOT, "directory: /quad-fast-py", "directory: /elsewhere"),
     (dependabot, DEPENDABOT, "interval: weekly", "interval: monthly"),

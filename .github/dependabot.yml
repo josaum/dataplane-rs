@@ -26,6 +26,25 @@ updates:
           - "arrow-*"
         update-types:
           - major
+    ignore:
+      # pyo3 0.30 drops `abi3-py38`. The wheels are built for Python 3.8 and
+      # later, so that upgrade waits for a decision to raise the floor.
+      - dependency-name: "pyo3*"
+        versions:
+          - ">=0.30"
+      # napi-derive 3 generates code only the napi 3 runtime accepts, so the
+      # two move together or not at all. The workspace keeps napi 2 because
+      # the consumer shells load the `.node` files it builds, the same shells
+      # that load parsers-rs's, which holds napi 2 for the same reason.
+      # quad-fast-node has not been tried on napi 3. Unblocked when the
+      # consumer shells accept a napi 3 build and quad-fast-node's
+      # smoke.test.mjs, panic.test.mjs and scripts/smoke-node.mjs pass on it.
+      - dependency-name: "napi"
+        versions:
+          - ">=3"
+      - dependency-name: "napi-derive"
+        versions:
+          - ">=3"
 
   - package-ecosystem: github-actions
     # Every action is pinned by commit SHA with its version in a trailing
@@ -37,8 +56,10 @@ updates:
       prefix: ci
       include: scope
 
-  - package-ecosystem: pip
-    # quad-fast-py's pyproject.toml: the pyarrow floor and the test group.
+  - package-ecosystem: uv
+    # quad-fast-py's uv.lock, which pins what pyproject.toml asks for (pyarrow
+    # and the test group); `uv run` in CI installs from it. Nothing there is
+    # managed by pip.
     directory: /quad-fast-py
     schedule:
       interval: weekly
