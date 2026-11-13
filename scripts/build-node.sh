@@ -6,6 +6,10 @@
 # carries a platform token; the tarball name does.
 #
 # Usage: scripts/build-node.sh [crate ...]
+#
+# NODE_CARGO_FEATURES, when set, is passed to cargo as `--features` (for
+# example `quad-fast-node/panic-probe` for panic.test.mjs). Releases never set
+# it.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -28,6 +32,7 @@ fi
 
 BUILD_ARGS=()
 for crate in "${CRATES[@]}"; do BUILD_ARGS+=(-p "$crate"); done
+if [ -n "${NODE_CARGO_FEATURES:-}" ]; then BUILD_ARGS+=(--features "$NODE_CARGO_FEATURES"); fi
 cargo build --release --locked "${BUILD_ARGS[@]}"
 
 for crate in "${CRATES[@]}"; do

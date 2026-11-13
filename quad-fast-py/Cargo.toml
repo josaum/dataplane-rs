@@ -26,6 +26,12 @@ quad-fast-core = { workspace = true }
 # platform, extension-module skips linking libpython.
 pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py38"] }
 
+[features]
+# Exports `_panic_probe()`, which panics on purpose, so tests/test_panic.py can
+# prove a Rust panic reaches Python as an exception. Never enabled for a
+# release; CI builds it through MATURIN_PEP517_ARGS.
+panic-probe = []
+
 [build-dependencies]
 # Emits the macOS `-undefined dynamic_lookup` cdylib link args, same as
 # the released json-fast-py. This is what lets `cargo test --workspace`

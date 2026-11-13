@@ -25,6 +25,11 @@ serde_json = { workspace = true }
 napi = { version = "2", features = ["serde-json"] }
 napi-derive = "2"
 
+[features]
+# Exports `panicProbe()`, which panics on purpose, so panic.test.mjs can prove
+# a Rust panic reaches JS as a thrown Error. Never enabled for a release.
+panic-probe = []
+
 [build-dependencies]
 napi-build = "2.2.0"
 
