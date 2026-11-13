@@ -6,21 +6,37 @@
 //! incoming schema and record batch and rejects non-conforming payloads with
 //! `INVALID_ARGUMENT`; a batch that fails validation is never stored and
 //! never served.
+//!
+//! Every ingest message (`DoPut`, `DoExchange`) passes
+//! [`quad_fast_core::preflight_ipc_message`] before Arrow sees it: body
+//! compression and delta dictionaries are refused, and every buffer must lie
+//! inside the body it arrived with. The Arrow decode itself then runs behind
+//! a panic barrier, so a malformed payload is a status, never a panic.
+
+use std::{
+    panic::AssertUnwindSafe,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
 
 use arrow_array::RecordBatch;
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, Result as ActionResult, SchemaAsIpc,
     SchemaResult, Ticket,
-    decode::{DecodedPayload, FlightDataDecoder},
+    decode::{DecodedFlightData, DecodedPayload, FlightDataDecoder},
     encode::{DictionaryHandling, FlightDataEncoderBuilder},
     error::FlightError,
     flight_descriptor::DescriptorType,
     flight_service_server::FlightService,
 };
 use arrow_ipc::writer::IpcWriteOptions;
-use futures::{StreamExt, TryStreamExt, stream, stream::BoxStream};
-use quad_fast_core::{QuadError, UnsignedQuadBatch, quad_stream_schema, validate_contract};
+use futures::{FutureExt, StreamExt, TryStreamExt, stream, stream::BoxStream};
+use quad_fast_core::{
+    QuadError, UnsignedQuadBatch, preflight_ipc_message, quad_stream_schema, validate_contract,
+};
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -58,6 +74,7 @@ type ResponseStream<T> = BoxStream<'static, Result<T, Status>>;
 pub struct QuadFlightService {
     limits: DatasetLimits,
     store: RwLock<DatasetStore>,
+    bytes: Arc<ByteBudget>,
 }
 
 impl QuadFlightService {
@@ -67,6 +84,7 @@ impl QuadFlightService {
         Self {
             limits,
             store: RwLock::new(DatasetStore::default()),
+            bytes: Arc::new(ByteBudget::default()),
         }
     }
 
@@ -74,6 +92,152 @@ impl QuadFlightService {
     #[must_use]
     pub fn limits(&self) -> DatasetLimits {
         self.limits
+    }
+}
+
+/// Bytes charged against the store-wide budget: stored plus in flight.
+#[derive(Debug, Default)]
+struct ByteBudget {
+    used: AtomicUsize,
+}
+
+impl ByteBudget {
+    /// Charges `bytes` when the total stays within `limit`.
+    fn try_charge(&self, bytes: usize, limit: usize) -> bool {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= limit)
+            })
+            .is_ok()
+    }
+
+    /// Returns `bytes` to the budget.
+    fn release(&self, bytes: usize) {
+        // Saturating: a release never exceeds what was charged, but an
+        // underflow here must not wrap into an exhausted budget.
+        let _ = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+}
+
+/// Bytes one upload has charged; released on drop unless committed.
+#[derive(Debug)]
+struct Reservation {
+    budget: Arc<ByteBudget>,
+    limits: DatasetLimits,
+    charged: AtomicUsize,
+    committed: AtomicBool,
+}
+
+impl Reservation {
+    fn new(budget: Arc<ByteBudget>, limits: DatasetLimits) -> Self {
+        Self {
+            budget,
+            limits,
+            charged: AtomicUsize::new(0),
+            committed: AtomicBool::new(false),
+        }
+    }
+
+    /// Charges one received message against the dataset and store budgets.
+    fn charge(&self, bytes: usize) -> Result<(), Status> {
+        let dataset = self.charged.load(Ordering::Acquire).saturating_add(bytes);
+        if dataset > self.limits.max_dataset_bytes {
+            return Err(Status::resource_exhausted(format!(
+                "resource_limit: dataset_bytes: observed {dataset} exceeds limit {}",
+                self.limits.max_dataset_bytes
+            )));
+        }
+        if !self.budget.try_charge(bytes, self.limits.max_store_bytes) {
+            return Err(Status::resource_exhausted(format!(
+                "resource_limit: store_bytes: store would exceed its limit of {} bytes",
+                self.limits.max_store_bytes
+            )));
+        }
+        self.charged.store(dataset, Ordering::Release);
+        Ok(())
+    }
+
+    /// Bytes charged so far.
+    fn charged(&self) -> usize {
+        self.charged.load(Ordering::Acquire)
+    }
+
+    /// Keeps the charge: the bytes now belong to a stored dataset.
+    fn commit(&self) {
+        self.committed.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.committed.load(Ordering::Acquire) {
+            self.budget.release(self.charged.load(Ordering::Acquire));
+        }
+    }
+}
+
+/// Wraps an ingest stream with the per-message guards.
+///
+/// Each message must arrive within `idle_timeout`, the stream may carry at
+/// most `max_messages_per_stream` messages, every message must pass
+/// [`preflight_ipc_message`], and, when `reservation` is given, its bytes are
+/// charged against the dataset and store byte budgets before decoding.
+fn guarded_ingest(
+    incoming: Streaming<FlightData>,
+    limits: DatasetLimits,
+    reservation: Option<Arc<Reservation>>,
+) -> BoxStream<'static, Result<FlightData, FlightError>> {
+    stream::try_unfold((incoming, 0_usize), move |(mut incoming, seen)| {
+        let reservation = reservation.clone();
+        async move {
+            let next = tokio::time::timeout(limits.idle_timeout, incoming.message())
+                .await
+                .map_err(|_elapsed| {
+                    status_to_flight(Status::deadline_exceeded(
+                        "ingest: no message arrived within the idle timeout",
+                    ))
+                })?
+                .map_err(status_to_flight)?;
+            let Some(data) = next else {
+                return Ok(None);
+            };
+            let seen = seen.saturating_add(1);
+            if seen > limits.max_messages_per_stream {
+                return Err(status_to_flight(Status::resource_exhausted(format!(
+                    "resource_limit: messages_per_stream: exceeds limit {}",
+                    limits.max_messages_per_stream
+                ))));
+            }
+            preflight_ipc_message(&data.data_header, &data.data_body).map_err(|error| {
+                status_to_flight(Status::invalid_argument(format!("flight_decode: {error}")))
+            })?;
+            if let Some(reservation) = &reservation {
+                reservation
+                    .charge(data.data_header.len().saturating_add(data.data_body.len()))
+                    .map_err(status_to_flight)?;
+            }
+            Ok(Some((data, (incoming, seen))))
+        }
+    })
+    .boxed()
+}
+
+/// Status for a decode that panicked inside Arrow.
+fn decode_panic_status() -> Status {
+    Status::invalid_argument("flight_decode: the payload could not be decoded")
+}
+
+/// Pulls the next decoded message behind a panic barrier.
+async fn next_decoded(
+    decoder: &mut FlightDataDecoder,
+) -> Option<Result<DecodedFlightData, Status>> {
+    match AssertUnwindSafe(decoder.next()).catch_unwind().await {
+        Ok(item) => item.map(|result| result.map_err(ingest_status)),
+        Err(_panic) => Some(Err(decode_panic_status())),
     }
 }
 
@@ -137,7 +301,10 @@ fn ensure_dataset_budget(limits: &DatasetLimits, batches: usize, quads: u64) -> 
 /// Accepted shapes are `["datasets", <name>]` and `[<name>]`; the name must
 /// be non-empty. Command descriptors and other path shapes are rejected with
 /// `INVALID_ARGUMENT`.
-fn dataset_name_from_descriptor(descriptor: &FlightDescriptor) -> Result<String, Status> {
+fn dataset_name_from_descriptor(
+    descriptor: &FlightDescriptor,
+    limits: &DatasetLimits,
+) -> Result<String, Status> {
     if descriptor.r#type != DescriptorType::Path as i32 {
         return Err(Status::invalid_argument(
             "descriptor: datasets are named by PATH descriptors, not CMD",
@@ -157,19 +324,42 @@ fn dataset_name_from_descriptor(descriptor: &FlightDescriptor) -> Result<String,
             "descriptor: dataset name must be non-empty",
         ));
     }
+    ensure_name_length(name, "descriptor", limits)?;
     Ok(name.clone())
 }
 
+/// Fails closed when a dataset name exceeds `max_name_bytes`.
+fn ensure_name_length(name: &str, carrier: &str, limits: &DatasetLimits) -> Result<(), Status> {
+    if name.len() > limits.max_name_bytes {
+        return Err(Status::invalid_argument(format!(
+            "{carrier}: dataset name exceeds {} bytes",
+            limits.max_name_bytes
+        )));
+    }
+    Ok(())
+}
+
+/// The one answer for a dataset name that is not stored.
+///
+/// Deliberately does not echo the name.
+fn dataset_not_found() -> Status {
+    Status::not_found("dataset is not stored")
+}
+
 /// Decodes a required non-empty UTF-8 dataset name from raw bytes.
-fn dataset_name_from_bytes(bytes: &[u8], carrier: &str) -> Result<String, Status> {
-    let name = std::str::from_utf8(bytes).map_err(|error| {
-        Status::invalid_argument(format!("{carrier}: name is not valid UTF-8: {error}"))
-    })?;
+fn dataset_name_from_bytes(
+    bytes: &[u8],
+    carrier: &str,
+    limits: &DatasetLimits,
+) -> Result<String, Status> {
+    let name = std::str::from_utf8(bytes)
+        .map_err(|_utf8| Status::invalid_argument(format!("{carrier}: name is not valid UTF-8")))?;
     if name.is_empty() {
         return Err(Status::invalid_argument(format!(
             "{carrier}: dataset name must be non-empty"
         )));
     }
+    ensure_name_length(name, carrier, limits)?;
     Ok(name.to_owned())
 }
 
@@ -272,11 +462,9 @@ impl FlightService for QuadFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let name = dataset_name_from_descriptor(request.get_ref())?;
+        let name = dataset_name_from_descriptor(request.get_ref(), &self.limits)?;
         let store = self.store.read().await;
-        let dataset = store
-            .get(&name)
-            .ok_or_else(|| Status::not_found(format!("dataset `{name}` is not stored")))?;
+        let dataset = store.get(&name).ok_or_else(dataset_not_found)?;
         Ok(Response::new(flight_info(&name, dataset.as_ref())?))
     }
 
@@ -298,7 +486,7 @@ impl FlightService for QuadFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        dataset_name_from_descriptor(request.get_ref())?;
+        dataset_name_from_descriptor(request.get_ref(), &self.limits)?;
         let options = IpcWriteOptions::default();
         let schema = quad_stream_schema();
         let result = SchemaResult::try_from(SchemaAsIpc::new(schema.as_ref(), &options))
@@ -311,12 +499,10 @@ impl FlightService for QuadFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        let name = dataset_name_from_bytes(&request.get_ref().ticket, "ticket")?;
+        let name = dataset_name_from_bytes(&request.get_ref().ticket, "ticket", &self.limits)?;
         let dataset = {
             let store = self.store.read().await;
-            store
-                .get(&name)
-                .ok_or_else(|| Status::not_found(format!("dataset `{name}` is not stored")))?
+            store.get(&name).ok_or_else(dataset_not_found)?
         };
         let batches = stream::iter(
             dataset
@@ -341,23 +527,29 @@ impl FlightService for QuadFlightService {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        let mut incoming = request.into_inner();
+        let limits = self.limits;
+        let reservation = Arc::new(Reservation::new(Arc::clone(&self.bytes), limits));
+        let mut incoming =
+            guarded_ingest(request.into_inner(), limits, Some(Arc::clone(&reservation)));
         let first = incoming
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("do_put: empty flight data stream"))?;
+            .next()
+            .await
+            .ok_or_else(|| Status::invalid_argument("do_put: empty flight data stream"))?
+            .map_err(ingest_status)?;
         let descriptor = first.flight_descriptor.clone().ok_or_else(|| {
             Status::invalid_argument("do_put: first flight data frame carries no descriptor")
         })?;
-        let name = dataset_name_from_descriptor(&descriptor)?;
+        let name = dataset_name_from_descriptor(&descriptor, &limits)?;
+        // A full store refuses a new name before the upload is read.
+        self.store.read().await.ensure_room_for(&name, &limits)?;
 
         let head = stream::iter([Ok::<FlightData, FlightError>(first)]);
-        let mut decoder = FlightDataDecoder::new(head.chain(incoming.map_err(FlightError::from)));
+        let mut decoder = FlightDataDecoder::new(head.chain(incoming));
 
         let mut batches: Vec<UnsignedQuadBatch> = Vec::new();
         let mut total_quads: u64 = 0;
-        while let Some(decoded) = decoder.next().await {
-            let decoded = decoded.map_err(ingest_status)?;
+        while let Some(decoded) = next_decoded(&mut decoder).await {
+            let decoded = decoded?;
             match decoded.payload {
                 DecodedPayload::Schema(schema) => {
                     validate_contract(schema.as_ref()).map_err(|error| quad_status(&error))?;
@@ -373,15 +565,19 @@ impl FlightService for QuadFlightService {
             }
         }
 
+        drop(decoder);
+
         let receipt = put_receipt(&name, batches.len(), total_quads);
         let dataset = Dataset {
             batches,
             total_quads,
+            bytes: reservation.charged(),
         };
-        self.store
-            .write()
-            .await
-            .insert(name, dataset, &self.limits)?;
+        let replaced = self.store.write().await.insert(name, dataset, &limits)?;
+        reservation.commit();
+        if let Some(replaced) = replaced {
+            self.bytes.release(replaced.bytes);
+        }
 
         let result = PutResult {
             app_metadata: receipt.into(),
@@ -401,11 +597,14 @@ impl FlightService for QuadFlightService {
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
         let limits = self.limits;
-        let decoder = FlightDataDecoder::new(request.into_inner().map_err(FlightError::from));
+        let decoder = FlightDataDecoder::new(guarded_ingest(request.into_inner(), limits, None));
         let mut seen_batches = 0_usize;
         let mut seen_quads = 0_u64;
-        let validated = decoder
+        // After a caught panic the barrier yields one error and ends the stream.
+        let validated = AssertUnwindSafe(decoder)
+            .catch_unwind()
             .map(move |decoded| -> Result<Option<RecordBatch>, FlightError> {
+                let decoded = decoded.map_err(|_panic| status_to_flight(decode_panic_status()))?;
                 match decoded?.payload {
                     DecodedPayload::Schema(schema) => {
                         validate_contract(schema.as_ref())
@@ -435,19 +634,23 @@ impl FlightService for QuadFlightService {
         let action = request.into_inner();
         let body = match action.r#type.as_str() {
             ACTION_DROP_DATASET => {
-                let name = dataset_name_from_bytes(&action.body, "action body")?;
-                let removed = self.store.write().await.remove(&name);
-                if removed.is_none() {
-                    return Err(Status::not_found(format!("dataset `{name}` is not stored")));
-                }
+                let name = dataset_name_from_bytes(&action.body, "action body", &self.limits)?;
+                let removed = self
+                    .store
+                    .write()
+                    .await
+                    .remove(&name)
+                    .ok_or_else(dataset_not_found)?;
+                self.bytes.release(removed.bytes);
                 format!("{{\"dropped\":{}}}", json_string(&name))
             }
             ACTION_RESET => {
-                let dropped = self.store.write().await.reset();
+                let (dropped, bytes) = self.store.write().await.reset();
+                self.bytes.release(bytes);
                 format!("{{\"reset\":{dropped}}}")
             }
-            other => {
-                return Err(Status::unimplemented(format!("unknown action `{other}`")));
+            _ => {
+                return Err(Status::unimplemented("unknown action type"));
             }
         };
         let result = ActionResult { body: body.into() };
@@ -494,18 +697,24 @@ mod tests {
 
     #[test]
     fn descriptor_convention_accepts_both_path_shapes() {
+        let limits = DatasetLimits::default();
         let long = FlightDescriptor::new_path(vec!["datasets".to_owned(), "d".to_owned()]);
-        assert_eq!(dataset_name_from_descriptor(&long).unwrap(), "d");
+        assert_eq!(dataset_name_from_descriptor(&long, &limits).unwrap(), "d");
 
         let short = FlightDescriptor::new_path(vec!["d".to_owned()]);
-        assert_eq!(dataset_name_from_descriptor(&short).unwrap(), "d");
+        assert_eq!(dataset_name_from_descriptor(&short, &limits).unwrap(), "d");
 
         let cmd = FlightDescriptor::new_cmd(vec![1_u8]);
-        let error = dataset_name_from_descriptor(&cmd).unwrap_err();
+        let error = dataset_name_from_descriptor(&cmd, &limits).unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
 
         let empty = FlightDescriptor::new_path(vec![String::new()]);
-        let error = dataset_name_from_descriptor(&empty).unwrap_err();
+        let error = dataset_name_from_descriptor(&empty, &limits).unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+        let oversized = FlightDescriptor::new_path(vec!["n".repeat(limits.max_name_bytes + 1)]);
+        let error = dataset_name_from_descriptor(&oversized, &limits).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(!error.message().contains("nnnn"), "the name is not echoed");
     }
 }

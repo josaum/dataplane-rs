@@ -26,8 +26,18 @@
 //! - `Handshake` / `PollFlightInfo` — `UNIMPLEMENTED` for now.
 //!
 //! All store growth is fail-closed behind [`DatasetLimits`] (maximum
-//! datasets, batches per dataset, and quads per dataset); exceeding a limit
-//! yields `RESOURCE_EXHAUSTED` and leaves the store unchanged.
+//! datasets, batches, quads and bytes per dataset, bytes across the store,
+//! messages per ingest stream, name length, message size, idle time and
+//! per-connection concurrency); exceeding a limit yields `RESOURCE_EXHAUSTED`
+//! (`DEADLINE_EXCEEDED` for the idle timeout) and leaves the store unchanged.
+//!
+//! # Authentication
+//!
+//! [`serve_with_verifier`] runs every RPC behind the shared `flight-auth`
+//! JWT metadata verifier and refuses to start with a verifier that does not
+//! require authentication or lacks an issuer and audience. [`serve`] and
+//! [`serve_with_limits`] authenticate nothing and therefore bind only a
+//! loopback address.
 //!
 //! The transport is term-agnostic: it validates the `UnsignedQuadStream`
 //! schema and column encodings, never a term, so batches carrying RDF 1.2
@@ -35,8 +45,8 @@
 //!
 //! # Features
 //!
-//! - `auth` — adds [`serve_with_verifier`], wiring the shared `flight-auth`
-//!   JWT metadata verifier from `office-parsers-rs` in front of every RPC.
+//! - `auth` — retained for compatibility and now empty: [`serve_with_verifier`]
+//!   is always available.
 //!
 //! # Examples
 //!
@@ -56,10 +66,10 @@ mod service;
 mod store;
 
 pub use limits::{
-    DEFAULT_MAX_BATCHES_PER_DATASET, DEFAULT_MAX_DATASETS, DEFAULT_MAX_QUADS_PER_DATASET,
-    DatasetLimits,
+    DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_BATCHES_PER_DATASET,
+    DEFAULT_MAX_CONCURRENT_REQUESTS_PER_CONNECTION, DEFAULT_MAX_DATASET_BYTES,
+    DEFAULT_MAX_DATASETS, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_MESSAGES_PER_STREAM,
+    DEFAULT_MAX_NAME_BYTES, DEFAULT_MAX_QUADS_PER_DATASET, DEFAULT_MAX_STORE_BYTES, DatasetLimits,
 };
-#[cfg(feature = "auth")]
-pub use serve::serve_with_verifier;
-pub use serve::{FlightServer, ServeError, serve, serve_with_limits};
+pub use serve::{FlightServer, ServeError, serve, serve_with_limits, serve_with_verifier};
 pub use service::{ACTION_DROP_DATASET, ACTION_RESET, QuadFlightService};

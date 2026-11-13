@@ -22,6 +22,9 @@ pub(crate) struct Dataset {
     pub(crate) batches: Vec<UnsignedQuadBatch>,
     /// Total quads across all batches.
     pub(crate) total_quads: u64,
+    /// Encoded bytes received for this dataset, as charged to the store
+    /// byte budget; released when the dataset is replaced or dropped.
+    pub(crate) bytes: usize,
 }
 
 /// Name-keyed dataset store enforcing the fail-closed dataset limits.
@@ -40,20 +43,29 @@ impl DatasetStore {
     ///
     /// Replacing an existing dataset never counts against `max_datasets`;
     /// only a store already holding `max_datasets` distinct names rejects a
-    /// new name with `RESOURCE_EXHAUSTED`.
+    /// new name with `RESOURCE_EXHAUSTED`. Returns the replaced dataset, so
+    /// the caller can release its bytes.
     pub(crate) fn insert(
         &mut self,
         name: String,
         dataset: Dataset,
         limits: &DatasetLimits,
-    ) -> Result<(), Status> {
-        if !self.datasets.contains_key(&name) && self.datasets.len() >= limits.max_datasets {
+    ) -> Result<Option<Arc<Dataset>>, Status> {
+        self.ensure_room_for(&name, limits)?;
+        Ok(self.datasets.insert(name, Arc::new(dataset)))
+    }
+
+    /// Fails closed when `name` is new and the store is already full.
+    ///
+    /// Checked before an upload is read, so a full store refuses a new name
+    /// without buffering it first, and again at insert.
+    pub(crate) fn ensure_room_for(&self, name: &str, limits: &DatasetLimits) -> Result<(), Status> {
+        if !self.datasets.contains_key(name) && self.datasets.len() >= limits.max_datasets {
             return Err(Status::resource_exhausted(format!(
                 "resource_limit: datasets: store already holds the maximum of {} datasets",
                 limits.max_datasets
             )));
         }
-        drop(self.datasets.insert(name, Arc::new(dataset)));
         Ok(())
     }
 
@@ -67,11 +79,14 @@ impl DatasetStore {
         self.datasets.remove(name)
     }
 
-    /// Removes every dataset and returns how many were dropped.
-    pub(crate) fn reset(&mut self) -> usize {
+    /// Removes every dataset and returns how many were dropped and their bytes.
+    pub(crate) fn reset(&mut self) -> (usize, usize) {
         let dropped = self.datasets.len();
+        let bytes = self.datasets.values().fold(0_usize, |total, dataset| {
+            total.saturating_add(dataset.bytes)
+        });
         self.datasets.clear();
-        dropped
+        (dropped, bytes)
     }
 
     /// Iterates datasets in lexicographic name order.
@@ -90,6 +105,7 @@ mod tests {
         Dataset {
             batches: Vec::new(),
             total_quads,
+            bytes: 0,
         }
     }
 
@@ -126,7 +142,7 @@ mod tests {
 
         assert!(store.remove("a").is_some());
         assert!(store.remove("a").is_none());
-        assert_eq!(store.reset(), 1);
+        assert_eq!(store.reset().0, 1);
         assert!(store.get("b").is_none());
     }
 
