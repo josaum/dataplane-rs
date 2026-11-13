@@ -275,7 +275,9 @@ fn reassemble_lists(
     budget.used.clear();
     let list_nodes: HashSet<String> = nodes
         .iter()
-        .filter(|(_, node)| is_list_node(node))
+        // Only blank nodes are list nodes (JSON-LD 1.1 API section 8.4.2
+        // step 6.4): converting an IRI-named chain would erase that IRI.
+        .filter(|(id, node)| id.starts_with("_:") && is_list_node(node))
         .map(|(id, _)| id.clone())
         .collect();
 
