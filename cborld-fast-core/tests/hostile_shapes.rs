@@ -343,3 +343,42 @@ fn repeated_registered_context_application_is_budgeted() {
         result.as_ref().map(|_| "decoded")
     );
 }
+
+/// 2,000 maximal (8 KiB) base58 multibase values in a 16 MiB payload.
+///
+/// Base58 reconstruction is quadratic per value (about 46 million digit
+/// steps for 8 KiB), so without a work budget this payload costs minutes of
+/// CPU. Ignored by default because the unbudgeted run is slow in a debug
+/// build; run it in release with `--ignored` to measure.
+#[test]
+#[ignore = "release-mode measurement of the base58 work budget"]
+fn many_maximal_base58_values_are_budgeted() {
+    let _serial = smoke::measure_alone();
+    let multibase = "https://w3id.org/security#multibase";
+    let definition = vec![
+        (text("@id"), text("http://e/m")),
+        (text("@type"), text(multibase)),
+    ];
+    let context = CborValue::Map(vec![(text("m"), CborValue::Map(definition))]);
+    let mut value = vec![0x01_u8; 8 * 1024];
+    value[0] = b'z';
+    let values = vec![CborValue::Bytes(value); 2_000];
+    let bytes = envelope(CborValue::Map(vec![
+        (CborValue::Unsigned(0), context),
+        (
+            CborValue::Unsigned(FIRST_TERM_ID + 1),
+            CborValue::Array(values),
+        ),
+    ]));
+    assert!(
+        bytes.len() < 16 * 1024 * 1024,
+        "input is {} bytes",
+        bytes.len()
+    );
+    let result = decompress(&bytes, &CborldOptions::default());
+    assert!(
+        is_resource(&result, "output_bytes"),
+        "{:?}",
+        result.as_ref().map(|_| "decoded")
+    );
+}

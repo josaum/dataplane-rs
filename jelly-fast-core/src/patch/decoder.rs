@@ -2,8 +2,8 @@
 // Rust guideline compliant 2026-02-21
 //! Fail-closed decoding of Jelly-Patch stream frames into patch ops.
 
-use oxrdf::Term;
-use quad_fast_core::{QuadBatchBuilder, QuadLimits};
+use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term, Triple};
+use quad_fast_core::{QuadBatchBuilder, QuadError, QuadLimits, QuadResource, encode_triple_term};
 
 use crate::{
     decoder::check_declared_table_sizes,
@@ -20,8 +20,9 @@ use crate::{
 /// Default most operations one patch frame may decode into: 1,024.
 ///
 /// Each statement run is its own Arrow batch, and an empty batch builder
-/// reserves about 130 KiB of capacity, so this bounds one frame at roughly
-/// 130 MiB live however small its rows are. A frame of more than 1,024
+/// reserves about 130 KiB of capacity, so this bounds that overhead at
+/// roughly 130 MiB per frame however small its rows are; the quad limits
+/// bound the frame's content across all of its runs. A frame of more than 1,024
 /// alternating add/delete runs (which the default encoder, at up to 8,192
 /// rows per frame, can emit for update-heavy patches) needs a larger value.
 pub const DEFAULT_MAX_PATCH_OPS_PER_FRAME: usize = 1024;
@@ -40,7 +41,9 @@ pub struct JellyPatchDecoderOptions {
     pub max_name_table_size: u32,
     /// Largest datatype lookup table this decoder accepts.
     pub max_datatype_table_size: u32,
-    /// Limits applied to every batch built from consecutive statements.
+    /// Limits applied to the statements of one frame, summed across all of
+    /// its add and delete runs (a frame of many small runs cannot retain
+    /// more than one batch could).
     pub quad_limits: QuadLimits,
     /// Most operations (statement runs, transaction markers, headers) one
     /// frame may decode into.
@@ -147,13 +150,15 @@ impl JellyPatchDecoder {
     /// than `max_ops_per_frame` operations; [`JellyError::Lookup`],
     /// [`JellyError::Frame`], and [`JellyError::Term`] for malformed row
     /// content or ordering (including transaction and header-placement
-    /// violations); and [`JellyError::Quad`] when batch construction hits
-    /// a quad limit.
+    /// violations); and [`JellyError::Quad`] when the frame's statements,
+    /// summed across all runs, hit a quad limit.
     pub fn decode_frame(&mut self, frame: &RdfPatchFrame) -> Result<Vec<PatchOp>, JellyError> {
         let mut ops = Vec::new();
         let mut pending: Option<PendingBatch> = None;
         let quad_limits = self.options.quad_limits;
         let max_ops = self.options.max_ops_per_frame;
+        let mut frame_quads: usize = 0;
+        let mut frame_bytes: usize = 0;
         // The vendored schema requires header rows at the start of the
         // patch frame; options and lookup entry rows do not displace them.
         let mut non_header_row_seen = false;
@@ -169,6 +174,9 @@ impl JellyPatchDecoder {
                     non_header_row_seen = true;
                     let is_add = matches!(row, rdf_patch_row::Row::StatementAdd(_));
                     let quad = self.state_mut()?.terms.decode_quad(quad)?;
+                    frame_quads = frame_quads.saturating_add(1);
+                    frame_bytes = frame_bytes.saturating_add(retained_term_bytes(&quad));
+                    check_frame_content(&quad_limits, frame_quads, frame_bytes)?;
                     let same_run = matches!(&pending, Some(batch) if batch.is_add == is_add);
                     if !same_run {
                         flush_pending(&mut pending, &mut ops)?;
@@ -399,6 +407,56 @@ impl JellyPatchDecoder {
         });
         Ok(())
     }
+}
+
+/// Refuses a frame whose statements, across all runs, exceed `limits`.
+fn check_frame_content(limits: &QuadLimits, quads: usize, bytes: usize) -> Result<(), JellyError> {
+    if quads > limits.max_quads {
+        return Err(JellyError::Quad(QuadError::ResourceLimit {
+            resource: QuadResource::Quads,
+            limit: limits.max_quads,
+            observed: quads,
+        }));
+    }
+    if bytes > limits.max_retained_term_bytes {
+        return Err(JellyError::Quad(QuadError::ResourceLimit {
+            resource: QuadResource::RetainedTermBytes,
+            limit: limits.max_retained_term_bytes,
+            observed: bytes,
+        }));
+    }
+    Ok(())
+}
+
+/// Bytes the quad contract retains for `quad`.
+///
+/// Mirrors the `max_retained_term_bytes` accounting of
+/// `QuadBatchBuilder::push`: lexical forms of every column, with a triple
+/// term counted as its serialized form.
+fn retained_term_bytes(quad: &Quad) -> usize {
+    let subject = match &quad.subject {
+        NamedOrBlankNode::NamedNode(node) => node.as_str().len(),
+        NamedOrBlankNode::BlankNode(node) => node.as_str().len(),
+    };
+    let object = match &quad.object {
+        Term::NamedNode(node) => node.as_str().len(),
+        Term::BlankNode(node) => node.as_str().len(),
+        Term::Literal(literal) => literal.value().len().saturating_add(
+            literal
+                .language()
+                .map_or_else(|| literal.datatype().as_str().len(), str::len),
+        ),
+        Term::Triple(triple) => encode_triple_term(Triple::as_ref(triple)).len(),
+    };
+    let graph = match &quad.graph_name {
+        GraphName::DefaultGraph => 0,
+        GraphName::NamedNode(node) => node.as_str().len(),
+        GraphName::BlankNode(node) => node.as_str().len(),
+    };
+    subject
+        .saturating_add(quad.predicate.as_str().len())
+        .saturating_add(object)
+        .saturating_add(graph)
 }
 
 /// Refuses a frame whose operation count would exceed `max_ops`.

@@ -362,3 +362,74 @@ fn alternating_patch_runs_are_bounded() {
         "{ops} ops from {wire} wire bytes allocated {spent} bytes"
     );
 }
+
+/// One 1 MiB literal, then 20 alternating runs of 60 repeated-term rows.
+///
+/// Each run stays under the per-batch 64 MiB retained-bytes limit, so
+/// unless the limit holds across the frame's runs, about 1 MB of wire
+/// retains 1.2 GB.
+#[test]
+fn retained_bytes_are_bounded_across_runs() {
+    let _serial = smoke::measure_alone();
+    let options = RdfPatchOptions {
+        statement_type: PatchStatementType::Quads.into(),
+        stream_type: PatchStreamType::Flat.into(),
+        generalized_statements: false,
+        rdf_star: false,
+        max_name_table_size: 4000,
+        max_prefix_table_size: 128,
+        max_datatype_table_size: 32,
+        version: PATCH_PROTOCOL_VERSION,
+    };
+    let quad = RdfQuad {
+        subject: Some(rdf_quad::Subject::SIri(iri(1, 1))),
+        predicate: Some(rdf_quad::Predicate::PIri(iri(1, 1))),
+        object: Some(rdf_quad::Object::OLiteral(
+            jelly_fast_core::proto::RdfLiteral {
+                lex: "x".repeat(1 << 20),
+                literal_kind: None,
+            },
+        )),
+        graph: Some(rdf_quad::Graph::GDefaultGraph(RdfDefaultGraph {})),
+    };
+    let mut rows = vec![
+        RdfPatchRow {
+            row: Some(rdf_patch_row::Row::Options(options)),
+        },
+        RdfPatchRow {
+            row: Some(rdf_patch_row::Row::Prefix(RdfPrefixEntry {
+                id: 1,
+                value: "http://e/".into(),
+            })),
+        },
+        RdfPatchRow {
+            row: Some(rdf_patch_row::Row::Name(RdfNameEntry {
+                id: 1,
+                value: "x".into(),
+            })),
+        },
+        RdfPatchRow {
+            row: Some(rdf_patch_row::Row::StatementAdd(quad)),
+        },
+    ];
+    for run in 0..20 {
+        for _ in 0..60 {
+            let empty = RdfQuad::default();
+            rows.push(RdfPatchRow {
+                row: Some(if run % 2 == 0 {
+                    rdf_patch_row::Row::StatementDelete(empty)
+                } else {
+                    rdf_patch_row::Row::StatementAdd(empty)
+                }),
+            });
+        }
+    }
+    let hostile = RdfPatchFrame { rows };
+    let wire = hostile.encode_to_vec().len();
+    let result = JellyPatchDecoder::new(JellyPatchDecoderOptions::default()).decode_frame(&hostile);
+    assert!(
+        matches!(&result, Err(JellyError::Quad(_))),
+        "{wire} wire bytes: {:?}",
+        result.as_ref().map(Vec::len)
+    );
+}
