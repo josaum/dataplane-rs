@@ -839,3 +839,58 @@ fn delta_dictionary_streams_are_refused() {
         "refusal must name the delta: {error}"
     );
 }
+
+// --- per-message pre-flight ----------------------------------------------
+
+/// Splits a self-written stream into its `(metadata, body)` messages.
+fn messages_of(stream: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut messages = Vec::new();
+    let mut offset = 0;
+    while offset + 8 <= stream.len() {
+        let metadata_len =
+            u32::from_le_bytes(stream[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        if metadata_len == 0 {
+            break;
+        }
+        let metadata = &stream[offset + 8..offset + 8 + metadata_len];
+        let body_len = usize::try_from(
+            arrow_ipc::root_as_message(metadata)
+                .expect("self-written metadata")
+                .bodyLength(),
+        )
+        .unwrap();
+        let body_start = offset + 8 + metadata_len;
+        messages.push((
+            metadata.to_vec(),
+            stream[body_start..body_start + body_len].to_vec(),
+        ));
+        offset = body_start + body_len;
+    }
+    messages
+}
+
+/// The pre-flight itself refuses a buffer outside its body.
+///
+/// Checked on `preflight_ipc_message` directly, not through `read_ipc_stream`,
+/// so the panic barrier behind it cannot mask a weakened bounds check.
+#[test]
+fn preflight_refuses_every_buffer_that_ends_past_the_body() {
+    let mut rng = Rng::new(MASTER_SEED ^ 0xB0D1);
+    let stream = valid_stream(&mut rng, 6);
+    let mut checked = 0;
+    for (metadata, body) in messages_of(&stream) {
+        quad_fast_core::preflight_ipc_message(&metadata, &body).expect("intact message");
+        if body.is_empty() {
+            continue;
+        }
+        // Header intact, body gone: every non-empty buffer now ends past it.
+        let error = quad_fast_core::preflight_ipc_message(&metadata, &[])
+            .expect_err("a header whose body is missing must be refused");
+        assert!(
+            error.to_string().contains("declares a buffer outside its"),
+            "refusal must come from the bounds check: {error}"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 2, "the stream must carry data-bearing messages");
+}
