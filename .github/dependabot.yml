@@ -18,8 +18,8 @@ updates:
         update-types:
           - minor
           - patch
-      # The Arrow crates share one exact version, so a new major moves all of
-      # them in one pull request.
+      # The Arrow crates share one exact version (Cargo.toml says why), so a
+      # new major moves all of them in one pull request.
       arrow-major:
         patterns:
           - "arrow"
@@ -45,6 +45,15 @@ updates:
       - dependency-name: "napi-derive"
         versions:
           - ">=3"
+      # Arrow is pinned to the version the consumers use (Cargo.toml says
+      # why), the same version parsers-rs pins, so a new major is the
+      # consumers' move first. Unblocked when the consumers take the new
+      # major: move every Arrow pin in Cargo.toml together and show the IPC
+      # and Flight round-trip tests pass. The `arrow-major` group above stays,
+      # so that upgrade arrives whole.
+      - dependency-name: "arrow*"
+        versions:
+          - ">=59"
 
   - package-ecosystem: github-actions
     # Every action is pinned by commit SHA with its version in a trailing

@@ -274,6 +274,7 @@ HOLDS = [
     ("pyo3*", ">=0.30", "pyo3 0.30 drops abi3-py38, which quad-fast-py builds"),
     ("napi", ">=3", "the consumer shells load napi 2 builds"),
     ("napi-derive", ">=3", "napi-derive 3 needs the napi 3 runtime"),
+    ("arrow*", ">=59", "Arrow is pinned to the consumers' 58"),
 ]
 
 
@@ -289,12 +290,40 @@ def held_reasons() -> set[str]:
     napi = napi.get("version", "") if isinstance(napi, dict) else napi
     if napi.split(".")[0] == "2":
         reasons.update({"napi", "napi-derive"})
+    workspace = tomllib.loads(read(ROOT / "Cargo.toml"))["workspace"]["dependencies"]
+    arrow = [
+        spec.get("version", "") if isinstance(spec, dict) else spec
+        for name, spec in workspace.items()
+        if name == "arrow" or name.startswith("arrow-")
+    ]
+    if arrow and all(version.startswith("=58.") for version in arrow):
+        reasons.add("arrow*")
     return reasons
+
+
+def assert_arrow_moves_together(update: dict) -> None:
+    """Every Arrow crate moves in the same pull request as the others."""
+    groups = update.get("groups") or {}
+    # A dependency joins the first group that matches, so a group listed
+    # before this one, or an exclusion from it, would split the Arrow crates.
+    assert list(groups)[:1] == ["cargo-minor-and-patch"], (
+        f"cargo-minor-and-patch must be the first cargo group, not {list(groups)[:1]}"
+    )
+    minor = groups["cargo-minor-and-patch"]
+    assert minor.get("patterns") == ["*"] and "exclude-patterns" not in minor, (
+        "minor and patch updates must arrive together, with nothing carved out"
+    )
+    assert minor.get("update-types") == ["minor", "patch"]
+    arrow = groups.get("arrow-major")
+    assert arrow is not None, "Arrow majors must arrive as one pull request"
+    assert arrow.get("patterns") == ["arrow", "arrow-*"], arrow.get("patterns")
+    assert arrow.get("update-types") == ["major"]
 
 
 def assert_dependabot_holds(document: dict) -> None:
     cargo = [u for u in document.get("updates") or [] if u.get("package-ecosystem") == "cargo"]
     assert cargo, "Dependabot has no cargo entry"
+    assert_arrow_moves_together(cargo[0])
     ignored = {
         entry.get("dependency-name"): entry.get("versions") or []
         for update in cargo
@@ -453,6 +482,22 @@ MUTATIONS = [
     (dependabot, DEPENDABOT, '- ">=0.30"', '- ">=0.31"'),
     (dependabot, DEPENDABOT, '- dependency-name: "napi"\n', '- dependency-name: "napi-sys"\n'),
     (dependabot, DEPENDABOT, '- dependency-name: "napi-derive"', '- dependency-name: "napi-build"'),
+    (dependabot, DEPENDABOT, '      - dependency-name: "arrow*"\n', '      - dependency-name: "arrow"\n'),
+    (dependabot, DEPENDABOT, '          - ">=59"\n', '          - ">=60"\n'),
+    (dependabot, DEPENDABOT, "      arrow-major:", "      arrow-anything:"),
+    (dependabot, DEPENDABOT, '          - "arrow-*"\n', ""),
+    (
+        dependabot,
+        DEPENDABOT,
+        "        update-types:\n          - minor\n",
+        "        exclude-patterns:\n          - arrow-*\n        update-types:\n          - minor\n",
+    ),
+    (
+        dependabot,
+        DEPENDABOT,
+        "      cargo-minor-and-patch:\n",
+        "      arrow:\n        patterns:\n          - arrow-*\n      cargo-minor-and-patch:\n",
+    ),
     (dependabot, DEPENDABOT, "package-ecosystem: github-actions", "package-ecosystem: docker"),
     (dependabot, DEPENDABOT, "directory: /quad-fast-py", "directory: /elsewhere"),
     (dependabot, DEPENDABOT, "interval: weekly", "interval: monthly"),
