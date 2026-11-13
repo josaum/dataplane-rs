@@ -485,12 +485,11 @@ fn many_single_item_lists_are_accepted() {
     assert_eq!(expanded.as_array().map(Vec::len), Some(LISTS));
 }
 
-/// A list whose two items are both the next list, 40 levels deep, would
-/// copy 2^40 values on `fromRdf`; repeated copies are charged against
-/// `max_nodes` and refused long before that.
-#[test]
-fn shared_nested_lists_are_refused_by_copy_budget() {
-    use oxrdf::{BlankNode, GraphName, NamedNode, Quad};
+/// Builds `rdf:first`/`rdf:rest` quads; `items(level)` names the first
+/// values of the list headed `_:l{level}` (each item is either a blank
+/// node label `_:x` or a plain literal).
+fn list_quads(levels: usize, items: impl Fn(usize) -> Vec<String>) -> Vec<RecordBatch> {
+    use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Quad, Term};
     use quad_fast_core::{QuadBatchBuilder, QuadLimits};
 
     let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -505,49 +504,75 @@ fn shared_nested_lists_are_refused_by_copy_budget() {
         BlankNode::new("l0").expect("label"),
         GraphName::DefaultGraph,
     ));
-    for level in 0..40 {
-        let head = BlankNode::new(format!("l{level}")).expect("label");
-        let second = BlankNode::new(format!("m{level}")).expect("label");
-        let next = BlankNode::new(format!("l{}", level + 1)).expect("label");
-        push(Quad::new(
-            head.clone(),
-            first.clone(),
-            next.clone(),
-            GraphName::DefaultGraph,
-        ));
-        push(Quad::new(
-            head,
-            rest.clone(),
-            second.clone(),
-            GraphName::DefaultGraph,
-        ));
-        push(Quad::new(
-            second.clone(),
-            first.clone(),
-            next,
-            GraphName::DefaultGraph,
-        ));
-        push(Quad::new(
-            second,
-            rest.clone(),
-            nil.clone(),
-            GraphName::DefaultGraph,
-        ));
+    for level in 0..=levels {
+        let values = items(level);
+        for (index, value) in values.iter().enumerate() {
+            let node = if index == 0 {
+                BlankNode::new(format!("l{level}")).expect("label")
+            } else {
+                BlankNode::new(format!("l{level}c{index}")).expect("label")
+            };
+            let object: Term = match value.strip_prefix("_:") {
+                Some(label) => BlankNode::new(label).expect("label").into(),
+                None => Literal::new_simple_literal(value.as_str()).into(),
+            };
+            push(Quad::new(
+                node.clone(),
+                first.clone(),
+                object,
+                GraphName::DefaultGraph,
+            ));
+            let next: Term = if index + 1 == values.len() {
+                nil.clone().into()
+            } else {
+                BlankNode::new(format!("l{level}c{}", index + 1))
+                    .expect("label")
+                    .into()
+            };
+            push(Quad::new(node, rest.clone(), next, GraphName::DefaultGraph));
+        }
     }
-    let last = BlankNode::new("l40").expect("label");
-    push(Quad::new(
-        last.clone(),
-        first.clone(),
-        oxrdf::Literal::new_simple_literal("x"),
-        GraphName::DefaultGraph,
-    ));
-    push(Quad::new(
-        last,
-        rest.clone(),
-        nil.clone(),
-        GraphName::DefaultGraph,
-    ));
-    let batches = vec![builder.finish().expect("batch")];
-    let error = from_quads(&batches).expect_err("exponential copies are refused");
+    vec![builder.finish().expect("batch")]
+}
+
+fn small_budget(max_nodes: usize) -> jsonld_fast_core::JsonLdLimits {
+    jsonld_fast_core::JsonLdLimits {
+        max_nodes,
+        ..jsonld_fast_core::JsonLdLimits::default()
+    }
+}
+
+/// A list whose two items are both the next list, 20 levels deep, copies
+/// about 2^20 values on `fromRdf`; repeated copies are charged against
+/// `max_nodes` and refused.
+#[test]
+fn shared_nested_lists_are_refused_by_copy_budget() {
+    let batches = list_quads(20, |level| {
+        if level == 20 {
+            vec!["x".to_owned()]
+        } else {
+            vec![format!("_:l{}", level + 1); 2]
+        }
+    });
+    let error = jsonld_fast_core::from_quads_with_limits(&batches, &small_budget(10_000))
+        .expect_err("exponential copies are refused");
     assert_eq!(error.code(), "resource_limit", "{error}");
+}
+
+/// A 2,000-item list wrapped in 100 single-item lists is copied into each
+/// wrapper as it is built: about 200,000 real copies, every one charged.
+#[test]
+fn nested_single_reference_lists_charge_their_copies() {
+    let batches = list_quads(100, |level| {
+        if level == 100 {
+            (0..2_000).map(|item| format!("v{item}")).collect()
+        } else {
+            vec![format!("_:l{}", level + 1)]
+        }
+    });
+    let error = jsonld_fast_core::from_quads_with_limits(&batches, &small_budget(1_000))
+        .expect_err("copies into wrapping lists are charged");
+    assert_eq!(error.code(), "resource_limit", "{error}");
+    // The defaults accept it: the copies are far below `max_nodes`.
+    assert!(from_quads(&batches).is_ok());
 }

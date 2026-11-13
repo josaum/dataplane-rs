@@ -261,14 +261,18 @@ fn render_node(id: &str, node: &NodeAcc) -> Value {
 /// [`JsonLdError::ResourceLimit`] with [`JsonLdResource::Depth`] when lists
 /// nest deeper than [`JsonLdLimits::max_depth`] (flat quads would otherwise
 /// build an arbitrarily deep value), and with [`JsonLdResource::Nodes`]
-/// when repeated copies of shared lists exceed [`JsonLdLimits::max_nodes`]
-/// (a list head referenced twice from each level doubles per level). The
-/// first use of each list is free: its values come from the input's own
-/// quads, so only duplication is charged.
+/// when list copies exceed [`JsonLdLimits::max_nodes`] (a list head
+/// referenced twice from each level doubles per level). Every copy of a
+/// nested list into its containing list is charged, and so is every
+/// placement of a list into a node property after its first: the first
+/// placement is the list's one rendering of the input's own quads.
 fn reassemble_lists(
     nodes: &mut BTreeMap<String, NodeAcc>,
     budget: &mut ListBudget,
 ) -> Result<(), JsonLdError> {
+    // Blank node labels are per graph here; a head's first placement is
+    // free once per graph.
+    budget.used.clear();
     let list_nodes: HashSet<String> = nodes
         .iter()
         .filter(|(_, node)| is_list_node(node))
@@ -423,14 +427,24 @@ impl ListBudget {
         }
     }
 
-    /// Charges placing the list headed by `head` (holding `size` values).
+    /// Charges placing the list headed by `head` (holding `size` values)
+    /// into a node property.
     ///
-    /// The first placement is free; every later one copies `size` values
-    /// and is charged before the copy is made.
+    /// The first placement is free (it is the list's one rendering of the
+    /// input's own quads); every later one copies `size` values and is
+    /// charged before the copy is made.
     fn use_list(&mut self, head: &str, size: usize) -> Result<(), JsonLdError> {
         if self.used.insert(head.to_owned()) {
             return Ok(());
         }
+        self.charge_copy(size)
+    }
+
+    /// Charges a copy of `size` values made while building another list.
+    ///
+    /// A nested list is copied into every list that contains it, so each
+    /// such copy is real duplication and always charged.
+    fn charge_copy(&mut self, size: usize) -> Result<(), JsonLdError> {
         self.copied = self.copied.saturating_add(size);
         if self.copied > self.max_nodes {
             return Err(JsonLdError::ResourceLimit {
@@ -560,7 +574,7 @@ fn resolve_nested_lists(
                     continue;
                 };
                 if let Some((nested, size)) = resolved.get(id) {
-                    budget.use_list(id, *size)?;
+                    budget.charge_copy(*size)?;
                     *item = nested.clone();
                 }
             }
