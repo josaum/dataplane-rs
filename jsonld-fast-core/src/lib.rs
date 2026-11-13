@@ -118,10 +118,17 @@
 //!   [`JsonLdLimits::max_nodes`] and [`JsonLdLimits::max_depth`] *before*
 //!   it is copied, even though expansion never descends into it (spec step
 //!   13.7 copies it verbatim);
-//! - context processing recurses on a scoped context and on a prefix
-//!   chain, neither of which is document nesting — a prefix chain is flat
-//!   JSON — so both are bounded by [`MAX_CONTEXT_RECURSION`] and refused
-//!   with [`JsonLdResource::ContextRecursion`];
+//! - context processing recurses on a scoped context, and a prefix chain
+//!   (flat JSON, `{"t0": "t1:x", "t1": "t2:x", ...}`) links terms without
+//!   any document nesting. Scoped-context recursion is bounded by
+//!   [`MAX_CONTEXT_RECURSION`]; a chain is ordered on an explicit stack
+//!   and refused past the same length before any definition is created
+//!   (a chain whose every link is a prefix holds quadratic bytes). Both
+//!   are [`JsonLdResource::ContextRecursion`];
+//! - expansion and compaction charge the strings they produce against
+//!   [`JsonLdLimits::max_output_bytes`] ([`JsonLdResource::OutputBytes`]):
+//!   a term mapped to a long IRI, or a long term name, is copied at every
+//!   use;
 //! - framing embeds referenced nodes inside their referrers, so a flat
 //!   chain of N nodes frames N levels deep: embedding is bounded by
 //!   [`MAX_FRAME_EMBED_DEPTH`] ([`JsonLdResource::EmbedDepth`]) and every
