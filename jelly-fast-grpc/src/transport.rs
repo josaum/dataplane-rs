@@ -16,12 +16,19 @@ use crate::error::JellyGrpcError;
 /// it accepted, and a client refuses an oversized publish before sending it.
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Longest wait for the next message of a publish stream: 30 s.
+/// Default longest wait for the next message of a publish stream: none.
 ///
-/// A publisher that goes quiet keeps its topic registered and its request
-/// open; this ends it with `DEADLINE_EXCEEDED`. Subscriptions are not
-/// bounded by it: waiting for frames is what a subscriber does.
-pub const DEFAULT_PUBLISH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A publish stream is often a change feed that is legitimately quiet for
+/// minutes, so no fixed default fits; a wrong one silently cuts live
+/// publishers off. Liveness is left to HTTP/2 keepalive (a ping every 30 s,
+/// the connection closed after 10 s without an answer), which ends a
+/// publisher whose peer vanished. Set a bound with `with_publish_idle_timeout`
+/// on the server to also end publishers that stay connected but send nothing.
+///
+/// A subscription outlives any one publisher: when a publisher ends, for
+/// whatever reason, its subscribers receive no end-of-stream and keep
+/// waiting for the topic's next publisher.
+pub const DEFAULT_PUBLISH_IDLE_TIMEOUT: Option<Duration> = None;
 
 /// Concurrent requests served on one connection (tonic default: unbounded).
 const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 64;
@@ -81,8 +88,11 @@ pub(crate) fn auth_gate(
 /// Receives the next message, failing when none arrives within `idle`.
 pub(crate) async fn next_message<T>(
     stream: &mut Streaming<T>,
-    idle: Duration,
+    idle: Option<Duration>,
 ) -> Result<Option<T>, Status> {
+    let Some(idle) = idle else {
+        return stream.message().await;
+    };
     tokio::time::timeout(idle, stream.message())
         .await
         .map_err(|_elapsed| {

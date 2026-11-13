@@ -5,6 +5,7 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use flight_auth::FlightRequestAuthVerifier;
 use futures::{Stream, StreamExt};
@@ -42,16 +43,40 @@ use crate::{
 /// `INVALID_ARGUMENT`, and subscribers that lag beyond the registry's
 /// bounded capacity receive an explicit `DATA_LOSS` status — frames are
 /// never dropped silently.
+///
+/// # Mounting it yourself
+///
+/// This service enforces nothing about who calls it. [`JellyPatchServer`] wraps it in
+/// the authentication gate, the loopback rule for unauthenticated binds, the
+/// message-size caps and the connection limits; mounting the service on a
+/// custom tonic server skips all of them, so do that only behind equivalent
+/// controls of your own.
 #[derive(Clone, Debug)]
 pub struct JellyPatchStreamService {
     registry: Arc<PatchTopicRegistry>,
+    publish_idle_timeout: Option<Duration>,
 }
 
 impl JellyPatchStreamService {
     /// Creates a service that routes streams through `registry`.
+    ///
+    /// Unguarded: see the type documentation before mounting it directly.
     #[must_use]
     pub fn new(registry: Arc<PatchTopicRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            publish_idle_timeout: DEFAULT_PUBLISH_IDLE_TIMEOUT,
+        }
+    }
+
+    /// Ends a publish stream that sends nothing for `timeout`.
+    ///
+    /// `None`, the default, waits indefinitely; see
+    /// [`crate::DEFAULT_PUBLISH_IDLE_TIMEOUT`] for why.
+    #[must_use]
+    pub fn with_publish_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.publish_idle_timeout = timeout;
+        self
     }
 }
 
@@ -121,7 +146,7 @@ impl PatchStreamService for JellyPatchStreamService {
         request: Request<Streaming<PatchPublish>>,
     ) -> Result<Response<PatchReceived>, Status> {
         let mut messages = request.into_inner();
-        let first = next_message(&mut messages, DEFAULT_PUBLISH_IDLE_TIMEOUT)
+        let first = next_message(&mut messages, self.publish_idle_timeout)
             .await?
             .ok_or_else(|| {
                 Status::invalid_argument("published patch stream contained no messages")
@@ -140,7 +165,7 @@ impl PatchStreamService for JellyPatchStreamService {
         // A send error only means no subscriber is currently attached;
         // at-most-once relay semantics are documented on the registry.
         let _ = sender.send(Arc::new(frame));
-        while let Some(message) = next_message(&mut messages, DEFAULT_PUBLISH_IDLE_TIMEOUT).await? {
+        while let Some(message) = next_message(&mut messages, self.publish_idle_timeout).await? {
             let frame = message.frame.ok_or_else(|| {
                 Status::invalid_argument("publish message must carry a patch frame")
             })?;
@@ -187,6 +212,7 @@ pub struct JellyPatchServer {
     local_addr: SocketAddr,
     registry: Arc<PatchTopicRegistry>,
     verifier: Option<FlightRequestAuthVerifier>,
+    publish_idle_timeout: Option<Duration>,
 }
 
 impl JellyPatchServer {
@@ -233,7 +259,18 @@ impl JellyPatchServer {
             local_addr,
             registry,
             verifier,
+            publish_idle_timeout: DEFAULT_PUBLISH_IDLE_TIMEOUT,
         })
+    }
+
+    /// Ends a publish stream that sends nothing for `timeout`.
+    ///
+    /// `None`, the default, waits indefinitely and leaves liveness to HTTP/2
+    /// keepalive; see [`crate::DEFAULT_PUBLISH_IDLE_TIMEOUT`].
+    #[must_use]
+    pub fn with_publish_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.publish_idle_timeout = timeout;
+        self
     }
 
     /// Address the server is bound to (useful after binding port 0).
@@ -249,9 +286,12 @@ impl JellyPatchServer {
     /// Returns [`JellyGrpcError::Transport`] when the tonic server stops
     /// with a transport error.
     pub async fn serve(self) -> Result<(), JellyGrpcError> {
-        let service = PatchStreamServiceServer::new(JellyPatchStreamService::new(self.registry))
-            .max_decoding_message_size(DEFAULT_MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(DEFAULT_MAX_MESSAGE_BYTES);
+        let service = PatchStreamServiceServer::new(
+            JellyPatchStreamService::new(self.registry)
+                .with_publish_idle_timeout(self.publish_idle_timeout),
+        )
+        .max_decoding_message_size(DEFAULT_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(DEFAULT_MAX_MESSAGE_BYTES);
         server_builder()
             .add_service(InterceptedService::new(service, auth_gate(self.verifier)))
             .serve_with_incoming(TcpListenerStream::new(self.listener))

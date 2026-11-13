@@ -19,10 +19,17 @@
 //! verifier that does not require authentication with an issuer and
 //! audience; plain `bind` authenticates nothing and binds only loopback.
 //! Clients attach credentials with `connect_with_authorization`. Messages
-//! are capped at [`DEFAULT_MAX_MESSAGE_BYTES`] both ways, a publish stream
-//! idle for [`DEFAULT_PUBLISH_IDLE_TIMEOUT`] ends with `DEADLINE_EXCEEDED`,
-//! and each registry holds at most [`DEFAULT_MAX_TOPICS`] live topics whose
+//! are capped at [`DEFAULT_MAX_MESSAGE_BYTES`] both ways, publish streams
+//! have no idle bound unless one is set (see
+//! [`DEFAULT_PUBLISH_IDLE_TIMEOUT`]), and each registry holds at most [`DEFAULT_MAX_TOPICS`] live topics whose
 //! names are at most [`MAX_TOPIC_NAME_BYTES`] bytes.
+//!
+//! Not provided: TLS (the transport is plaintext HTTP/2; put it behind a
+//! TLS-terminating proxy or a mesh), tenant scoping (any token with
+//! `flight:invoke` can publish or subscribe to any topic), and expiry of open
+//! streams (a token is checked when a stream opens and an open subscription
+//! outlives its `exp`). [`JellyStreamService::new`] and
+//! [`JellyPatchStreamService::new`] are unguarded when mounted directly.
 //!
 //! The transport is codec-transparent: [`JellyClient`] passes
 //! `jelly-fast-core` encoder and decoder options straight through, so RDF

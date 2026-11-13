@@ -4,6 +4,7 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use flight_auth::FlightRequestAuthVerifier;
 use futures::{Stream, StreamExt};
@@ -35,16 +36,40 @@ use crate::{
 /// `INVALID_ARGUMENT` per the `grpc.proto` contract, and subscribers that
 /// lag beyond the registry's bounded capacity receive an explicit
 /// `DATA_LOSS` status — frames are never dropped silently.
+///
+/// # Mounting it yourself
+///
+/// This service enforces nothing about who calls it. [`JellyServer`] wraps it in
+/// the authentication gate, the loopback rule for unauthenticated binds, the
+/// message-size caps and the connection limits; mounting the service on a
+/// custom tonic server skips all of them, so do that only behind equivalent
+/// controls of your own.
 #[derive(Clone, Debug)]
 pub struct JellyStreamService {
     registry: Arc<TopicRegistry>,
+    publish_idle_timeout: Option<Duration>,
 }
 
 impl JellyStreamService {
     /// Creates a service that routes streams through `registry`.
+    ///
+    /// Unguarded: see the type documentation before mounting it directly.
     #[must_use]
     pub fn new(registry: Arc<TopicRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            publish_idle_timeout: DEFAULT_PUBLISH_IDLE_TIMEOUT,
+        }
+    }
+
+    /// Ends a publish stream that sends nothing for `timeout`.
+    ///
+    /// `None`, the default, waits indefinitely; see
+    /// [`crate::DEFAULT_PUBLISH_IDLE_TIMEOUT`] for why.
+    #[must_use]
+    pub fn with_publish_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.publish_idle_timeout = timeout;
+        self
     }
 }
 
@@ -112,7 +137,7 @@ impl RdfStreamService for JellyStreamService {
         request: Request<Streaming<RdfStreamFrame>>,
     ) -> Result<Response<RdfStreamReceived>, Status> {
         let mut frames = request.into_inner();
-        let first = next_message(&mut frames, DEFAULT_PUBLISH_IDLE_TIMEOUT)
+        let first = next_message(&mut frames, self.publish_idle_timeout)
             .await?
             .ok_or_else(|| Status::invalid_argument("published stream contained no frames"))?;
         let options = leading_options(&first)?;
@@ -127,7 +152,7 @@ impl RdfStreamService for JellyStreamService {
         // A send error only means no subscriber is currently attached;
         // at-most-once relay semantics are documented on TopicRegistry.
         let _ = sender.send(Arc::new(first));
-        while let Some(frame) = next_message(&mut frames, DEFAULT_PUBLISH_IDLE_TIMEOUT).await? {
+        while let Some(frame) = next_message(&mut frames, self.publish_idle_timeout).await? {
             let _ = sender.send(Arc::new(frame));
         }
         Ok(Response::new(RdfStreamReceived {}))
@@ -166,6 +191,7 @@ pub struct JellyServer {
     local_addr: SocketAddr,
     registry: Arc<TopicRegistry>,
     verifier: Option<FlightRequestAuthVerifier>,
+    publish_idle_timeout: Option<Duration>,
 }
 
 impl JellyServer {
@@ -212,7 +238,18 @@ impl JellyServer {
             local_addr,
             registry,
             verifier,
+            publish_idle_timeout: DEFAULT_PUBLISH_IDLE_TIMEOUT,
         })
+    }
+
+    /// Ends a publish stream that sends nothing for `timeout`.
+    ///
+    /// `None`, the default, waits indefinitely and leaves liveness to HTTP/2
+    /// keepalive; see [`crate::DEFAULT_PUBLISH_IDLE_TIMEOUT`].
+    #[must_use]
+    pub fn with_publish_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.publish_idle_timeout = timeout;
+        self
     }
 
     /// Address the server is bound to (useful after binding port 0).
@@ -228,9 +265,12 @@ impl JellyServer {
     /// Returns [`JellyGrpcError::Transport`] when the tonic server stops
     /// with a transport error.
     pub async fn serve(self) -> Result<(), JellyGrpcError> {
-        let service = RdfStreamServiceServer::new(JellyStreamService::new(self.registry))
-            .max_decoding_message_size(DEFAULT_MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(DEFAULT_MAX_MESSAGE_BYTES);
+        let service = RdfStreamServiceServer::new(
+            JellyStreamService::new(self.registry)
+                .with_publish_idle_timeout(self.publish_idle_timeout),
+        )
+        .max_decoding_message_size(DEFAULT_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(DEFAULT_MAX_MESSAGE_BYTES);
         server_builder()
             .add_service(InterceptedService::new(service, auth_gate(self.verifier)))
             .serve_with_incoming(TcpListenerStream::new(self.listener))
