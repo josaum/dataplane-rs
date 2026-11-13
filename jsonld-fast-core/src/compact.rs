@@ -1438,7 +1438,7 @@ fn unwrap_single(value: Value, compact_arrays: bool) -> Value {
 /// terms whose IRI mapping is a proper prefix of `var`.
 fn compact_iri_candidate(ctx: &Context, var: &str, value_is_null: bool) -> Option<String> {
     let mut best: Option<String> = None;
-    for (term, definition) in &ctx.terms {
+    for (term, definition) in ctx.terms.iter() {
         if !definition.prefix || term == "_" {
             continue;
         }

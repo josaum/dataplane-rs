@@ -64,13 +64,14 @@ pub(crate) fn frame_document(
     document: &Value,
     frame: &Value,
     options: &JsonLdOptions,
+    (document_budget, frame_budget): (usize, usize),
 ) -> Result<Value, JsonLdError> {
     let Value::Object(frame_map) = frame else {
         return Err(JsonLdError::InvalidFrame(
             "a frame must be a map".to_owned(),
         ));
     };
-    let expanded_frame = expand::expand_frame_document(frame, options)?;
+    let expanded_frame = expand::expand_frame_document(frame, options, frame_budget)?;
     let frame_object = match &expanded_frame {
         Value::Array(items) if items.is_empty() => Map::new(),
         Value::Array(items) if items.len() == 1 => match &items[0] {
@@ -89,7 +90,7 @@ pub(crate) fn frame_document(
     };
     validate_frame(&frame_object)?;
 
-    let expanded_input = expand::expand_document(document, options)?;
+    let expanded_input = expand::expand_document(document, options, document_budget)?;
     let graphs = build_node_map(&expanded_input)?;
     let subjects: Vec<String> = graphs
         .get(DEFAULT_GRAPH)

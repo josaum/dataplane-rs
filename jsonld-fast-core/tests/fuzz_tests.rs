@@ -232,6 +232,7 @@ fn fuzz_options() -> JsonLdOptions {
             max_input_bytes: 1 << 20,
             max_nodes: 20_000,
             max_depth: 64,
+            max_output_bytes: None,
         },
         quad_limits: QuadLimits {
             max_quads: 20_000,

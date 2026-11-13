@@ -221,7 +221,10 @@ pub(crate) struct TermDefinition {
     pub(crate) nest: Option<String>,
     /// Scoped (embedded) context, stored raw and re-applied at expansion
     /// time (JSON-LD 1.1 API section 4.2.2 step 21).
-    pub(crate) local_context: Option<Value>,
+    ///
+    /// Shared (`Rc`), so copying a definition per node is O(1), and its
+    /// address identifies it for the expander's scoped-context cache.
+    pub(crate) local_context: Option<Rc<Value>>,
 }
 
 impl TermDefinition {
@@ -243,7 +246,11 @@ impl TermDefinition {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Context {
     /// Term definitions, including keyword aliases.
-    pub(crate) terms: HashMap<String, TermDefinition>,
+    ///
+    /// Copy-on-write (`Rc`): cloning a context per node is O(1), and only
+    /// context processing, which defines terms, makes a private copy. The
+    /// map's address identifies the scope for the scoped-context cache.
+    pub(crate) terms: Rc<HashMap<String, TermDefinition>>,
     /// `@vocab` mapping.
     pub(crate) vocab: Option<String>,
     /// `@base` IRI.
@@ -748,7 +755,7 @@ fn create_term_definition(
     // result is discarded) and stored raw for re-application at expansion.
     if let Some(scoped) = entries.get("@context") {
         validate_scoped_context(ctx, term, scoped, depth)?;
-        definition.local_context = Some(scoped.clone());
+        definition.local_context = Some(Rc::new(scoped.clone()));
     }
 
     // Spec section 4.2.2 step 23: `@nest` must be `@nest` itself or a value
@@ -913,7 +920,7 @@ fn store_definition(
         }
         definition.protected = true;
     }
-    ctx.terms.insert(term.to_owned(), definition);
+    Rc::make_mut(&mut ctx.terms).insert(term.to_owned(), definition);
     defined.insert(term.to_owned(), true);
     Ok(())
 }

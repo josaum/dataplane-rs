@@ -26,6 +26,11 @@ pub enum JsonLdResource {
     /// references in the node map, so a flat document of chained nodes
     /// embeds as deep as the chain is long.
     EmbedDepth,
+    /// Bytes of strings produced by expansion (keys, IRIs, values).
+    ///
+    /// Governed by [`crate::JsonLdLimits::max_output_bytes`]: a term that
+    /// expands to a long IRI multiplies the input by every use.
+    OutputBytes,
 }
 
 impl JsonLdResource {
@@ -38,6 +43,7 @@ impl JsonLdResource {
             Self::Depth => "depth",
             Self::ContextRecursion => "context_recursion",
             Self::EmbedDepth => "embed_depth",
+            Self::OutputBytes => "output_bytes",
         }
     }
 }

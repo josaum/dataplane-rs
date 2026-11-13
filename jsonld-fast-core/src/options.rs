@@ -70,6 +70,24 @@ pub(crate) const FRAME_STACK_PER_EMBED_LEVEL: usize = 128 * 1024;
 /// Fixed native stack of the framing worker, for the non-recursive frames.
 pub(crate) const FRAME_WORKER_BASE_STACK: usize = 1024 * 1024;
 
+/// Output bytes allowed per byte of input when no explicit
+/// [`JsonLdLimits::max_output_bytes`] is set: 16.
+///
+/// Expansion turns short terms into full IRIs and wraps every value in an
+/// object, so legitimate output is a small multiple of the input; the
+/// W3C fixtures and the benchmark documents stay below 8 (measured as
+/// charged bytes over the estimated input size). 16 doubles that margin.
+/// A term mapped to a 1 MiB IRI and used 128 times is 128 times its input
+/// and is refused.
+pub const OUTPUT_BYTES_PER_INPUT_BYTE: usize = 16;
+
+/// Output bytes always allowed regardless of input size: 16 MiB.
+///
+/// Small documents legitimately expand by more than
+/// [`OUTPUT_BYTES_PER_INPUT_BYTE`] (a one-letter term becomes a 30-byte
+/// IRI); the floor keeps every such document well inside the budget.
+pub const OUTPUT_BYTES_FLOOR: usize = 16 * 1024 * 1024;
+
 /// Fail-closed limits for one JSON-LD processing run.
 #[derive(Clone, Copy, Debug)]
 pub struct JsonLdLimits {
@@ -79,6 +97,25 @@ pub struct JsonLdLimits {
     pub max_nodes: usize,
     /// Maximum nesting depth reached during expansion.
     pub max_depth: usize,
+    /// Maximum bytes of strings expansion may produce (expanded keys and
+    /// IRIs, `@vocab`/`@base` resolutions, and copied values).
+    ///
+    /// `None` (the default) derives the budget from the input:
+    /// [`OUTPUT_BYTES_PER_INPUT_BYTE`] times its estimated serialized size,
+    /// plus [`OUTPUT_BYTES_FLOOR`]. `Some(bytes)` sets it outright.
+    pub max_output_bytes: Option<usize>,
+}
+
+impl JsonLdLimits {
+    /// The output budget for an input of about `input_bytes` bytes.
+    #[must_use]
+    pub fn output_budget(&self, input_bytes: usize) -> usize {
+        self.max_output_bytes.unwrap_or_else(|| {
+            input_bytes
+                .saturating_mul(OUTPUT_BYTES_PER_INPUT_BYTE)
+                .saturating_add(OUTPUT_BYTES_FLOOR)
+        })
+    }
 }
 
 impl Default for JsonLdLimits {
@@ -87,6 +124,7 @@ impl Default for JsonLdLimits {
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
             max_nodes: DEFAULT_MAX_NODES,
             max_depth: DEFAULT_MAX_DEPTH,
+            max_output_bytes: None,
         }
     }
 }

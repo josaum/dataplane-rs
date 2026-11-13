@@ -215,7 +215,7 @@ use serde_json::Value;
 pub use error::{JsonLdError, JsonLdFeature, JsonLdResource};
 pub use options::{
     DEFAULT_MAX_DEPTH, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_NODES, JsonLdLimits, JsonLdOptions,
-    MAX_CONTEXT_RECURSION, MAX_FRAME_EMBED_DEPTH,
+    MAX_CONTEXT_RECURSION, MAX_FRAME_EMBED_DEPTH, OUTPUT_BYTES_FLOOR, OUTPUT_BYTES_PER_INPUT_BYTE,
 };
 pub use streaming::{
     ExpandStreamingGraph, STREAMING_PROFILE, StreamingGraphNodes, compact_streaming,
@@ -255,8 +255,11 @@ pub fn parse_document(text: &str, limits: &JsonLdLimits) -> Result<Value, JsonLd
 /// Input nested deeper than a few levels runs on a short-lived worker
 /// thread; [`JsonLdError::WorkerUnavailable`] when it cannot be started.
 pub fn expand(document: &Value, options: &JsonLdOptions) -> Result<Value, JsonLdError> {
-    let depth = guard::check_nesting(document, options.limits.max_depth)?;
-    guard::run_sized(depth, || expand::expand_document(document, options))
+    let shape = guard::check_nesting(document, options.limits.max_depth)?;
+    let budget = options.limits.output_budget(shape.bytes);
+    guard::run_sized(shape.depth, || {
+        expand::expand_document(document, options, budget)
+    })
 }
 
 /// Compacts a JSON-LD document against an inline context
@@ -287,10 +290,13 @@ pub fn compact(
 ) -> Result<Value, JsonLdError> {
     // The context is caller-built and is cloned below; `Clone` recurses, so
     // its nesting is bounded before anything touches it.
-    let context_depth = guard::check_nesting(context, options.limits.max_depth)?;
-    let document_depth = guard::check_nesting(document, options.limits.max_depth)?;
+    let context_shape = guard::check_nesting(context, options.limits.max_depth)?;
+    let document_shape = guard::check_nesting(document, options.limits.max_depth)?;
+    let context_depth = context_shape.depth;
+    let document_depth = document_shape.depth;
+    let budget = options.limits.output_budget(document_shape.bytes);
     guard::run_sized(context_depth.max(document_depth), || {
-        let expanded = expand::expand_document(document, options)?;
+        let expanded = expand::expand_document(document, options, budget)?;
         let context_value = match context {
             Value::Object(map) => map
                 .get("@context")
@@ -339,10 +345,16 @@ pub fn frame(
     frame: &Value,
     options: &JsonLdOptions,
 ) -> Result<Value, JsonLdError> {
-    let frame_depth = guard::check_nesting(frame, options.limits.max_depth)?;
-    let document_depth = guard::check_nesting(document, options.limits.max_depth)?;
+    let frame_shape = guard::check_nesting(frame, options.limits.max_depth)?;
+    let document_shape = guard::check_nesting(document, options.limits.max_depth)?;
+    let frame_depth = frame_shape.depth;
+    let document_depth = document_shape.depth;
+    let budgets = (
+        options.limits.output_budget(document_shape.bytes),
+        options.limits.output_budget(frame_shape.bytes),
+    );
     guard::run_sized(frame_depth.max(document_depth), || {
-        frame::frame_document(document, frame, options)
+        frame::frame_document(document, frame, options, budgets)
     })
 }
 
@@ -367,9 +379,10 @@ pub fn to_quads(
     options: &JsonLdOptions,
     provenance: Option<&SourceProvenance>,
 ) -> Result<Vec<RecordBatch>, JsonLdError> {
-    let depth = guard::check_nesting(document, options.limits.max_depth)?;
-    let quads = guard::run_sized(depth, || {
-        let expanded = expand::expand_document(document, options)?;
+    let shape = guard::check_nesting(document, options.limits.max_depth)?;
+    let budget = options.limits.output_budget(shape.bytes);
+    let quads = guard::run_sized(shape.depth, || {
+        let expanded = expand::expand_document(document, options, budget)?;
         to_rdf::expanded_to_quads(&expanded)
     })?;
     let mut builder = QuadBatchBuilder::new(options.quad_limits);
