@@ -174,7 +174,7 @@ INSTALL = re.compile(
 )
 
 
-def assert_audit_contract(audit: str, ci: str, release: str) -> None:
+def assert_audit_contract(audit: str, ci: str, release: str, policy_text: str | None = None) -> None:
     document = load(audit)
     on = triggers(document)
     assert "pull_request" in on, "the audit must run on every pull request"
@@ -200,8 +200,14 @@ def assert_audit_contract(audit: str, ci: str, release: str) -> None:
         "deny and audit share a job, so one failure would hide the other"
     )
     assert DENY_CONFIG.is_file(), "cargo-deny needs deny.toml"
-    policy = tomllib.loads(read(DENY_CONFIG))
-    assert policy["advisories"].get("ignore", []) == [], "no advisory may be waved through"
+    policy = tomllib.loads(read(DENY_CONFIG) if policy_text is None else policy_text)
+    advisories = policy["advisories"]
+    assert advisories.get("ignore", []) == [], "no advisory may be waved through"
+    # Without `unsound = "all"`, cargo-deny 0.20.2 lets a transitive unsound
+    # crate through that `cargo audit --deny unsound` fails on.
+    for key in ("unsound", "unmaintained"):
+        assert advisories.get(key) == "all", f"deny.toml must fail any {key} crate, not {advisories.get(key)!r}"
+    assert advisories.get("yanked") == "deny", "a yanked version must fail"
     for workflow in (ci, release):
         parsed = load(workflow)
         called = [str(step.get("uses", "")) for _, step in steps(parsed)]
@@ -383,9 +389,9 @@ def publisher(path: Path, original: str, replacement: str) -> None:
 
 
 def audit(path: Path, original: str, replacement: str) -> None:
-    texts = {AUDIT: read(AUDIT), CI: read(CI), RELEASE: read(RELEASE)}
+    texts = {AUDIT: read(AUDIT), CI: read(CI), RELEASE: read(RELEASE), DENY_CONFIG: read(DENY_CONFIG)}
     texts[path] = texts[path].replace(original, replacement, 1)
-    assert_audit_contract(texts[AUDIT], texts[CI], texts[RELEASE])
+    assert_audit_contract(texts[AUDIT], texts[CI], texts[RELEASE], texts[DENY_CONFIG])
 
 
 def dependabot(path: Path, original: str, replacement: str) -> None:
@@ -437,6 +443,9 @@ MUTATIONS = [
         "    uses: ./.github/workflows/ci.yml\n",
         "    uses: ./.github/workflows/ci.yml\n  advisories:\n    uses: ./.github/workflows/audit.yml\n",
     ),
+    (audit, DENY_CONFIG, 'unsound = "all"\n', ""),
+    (audit, DENY_CONFIG, 'unmaintained = "all"\n', 'unmaintained = "workspace"\n'),
+    (audit, DENY_CONFIG, "ignore = []", 'ignore = ["RUSTSEC-2026-0442"]'),
     # 4. Dependabot
     (dependabot, DEPENDABOT, "package-ecosystem: npm", "package-ecosystem: bundler"),
     (dependabot, DEPENDABOT, "package-ecosystem: uv", "package-ecosystem: pip"),

@@ -17,9 +17,12 @@ all-features = true
 ignore = []
 # A version withdrawn from crates.io by its author fails as well.
 yanked = "deny"
-# An unmaintained crate fails wherever it sits in the graph, not only as a
-# direct dependency.
+# An unmaintained or unsound crate fails wherever it sits in the graph, not
+# only as a direct dependency. For `unsound` this must be said: without it,
+# cargo-deny 0.20.2 passed the transitive unsound arrow-data and rustix that
+# `cargo audit --deny unsound` fails on.
 unmaintained = "all"
+unsound = "all"
 
 [licenses]
 # The workspace is distributed as MIT. A dependency passes when its licence
