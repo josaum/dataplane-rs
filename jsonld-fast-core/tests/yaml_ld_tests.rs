@@ -262,3 +262,20 @@ fn large_flat_graph_is_not_refused_for_its_keys() {
     let document = parse_yaml_ld(&text, &YamlLdOptions::default()).expect("keys are not charged");
     assert_eq!(document["@graph"].as_array().map(Vec::len), Some(220_000));
 }
+
+/// YAML 1.2 requires the keys of a mapping to be unique. saphyr 0.0.12 kept
+/// the last value of a repeated key, so a document could say two things and
+/// silently mean one; saphyr 0.3 refuses it, in both profiles.
+#[test]
+fn a_repeated_mapping_key_is_refused() {
+    let yaml = "name: Alice\nname: Bob\n";
+    for profile in [YamlLdProfile::Basic, YamlLdProfile::Extended] {
+        let options = YamlLdOptions {
+            profile,
+            ..YamlLdOptions::default()
+        };
+        let error = parse_yaml_ld(yaml, &options).expect_err("a repeated key");
+        assert_eq!(error.code(), "loading_document_failed", "{profile:?}");
+        assert!(error.to_string().contains("duplicated key"), "{error}");
+    }
+}
