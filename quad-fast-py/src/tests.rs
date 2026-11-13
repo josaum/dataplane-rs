@@ -464,17 +464,16 @@ fn triple_term_batches_are_refused_before_jelly_encoding() {
 }
 
 // ---------------------------------------------------------------------------
-// JSON-LD decode: cartridge audit lines and sovereign refusals.
+// JSON-LD decode: telemetry audit lines and sovereign refusals.
 // ---------------------------------------------------------------------------
 
-/// One emitted line of the cartridge event log; the regeneration command
-/// lives in `jsonld-fast-core/tests/cartridge_audit_tests.rs`.
-const CARTRIDGE_EVENT_LINE: &str = r#"{"@context":{"@version":1.1,"@vocab":"urn:atlas:","atlas":"urn:atlas:","xsd":"http://www.w3.org/2001/XMLSchema#","id":"@id","type":"@type","named_graph":{"@id":"atlas:namedGraph","@type":"@id"},"occurred_at":{"@id":"atlas:occurredAt","@type":"xsd:dateTime"},"metric_id":"atlas:metricId","target_metric_id":"atlas:metricId","entity_id":"atlas:entityId","source":"atlas:source","detail":"atlas:detail","question":"atlas:question","persona":"atlas:persona","status":"atlas:status","grain":"atlas:grain","event_id":{"@id":"atlas:eventId","@type":"@id"},"trace_id":{"@id":"atlas:traceId","@type":"@id"},"hypotheses":{"@id":"atlas:hypotheses","@container":"@set"},"paths":{"@id":"atlas:paths","@container":"@set"},"signed_by":"atlas:signedBy","corrected_label":"atlas:correctedLabel"},"id":"urn:uuid:7bb73a56-9116-44e7-a5d3-0c5061ed805e","type":"ObservationRecorded","named_graph":"urn:atlas:graph:events:v1","occurred_at":"2026-09-01T19:34:35.499204Z","metric_id":"roas","source":"pacvue","entity_id":"asin:B0XYZ","detail":{"value":3.6,"grain":"asin","asOf":"2026-09-01T19:34:35.499035+00:00"}}"#;
+/// One emitted line of the telemetry event log (`jsonld-fast-core/tests/cartridge_audit_tests.rs`).
+const TELEMETRY_EVENT_LINE: &str = r#"{"@context":{"@version":1.1,"@vocab":"urn:dataplane:","dp":"urn:dataplane:","xsd":"http://www.w3.org/2001/XMLSchema#","id":"@id","type":"@type","named_graph":{"@id":"dp:namedGraph","@type":"@id"},"occurred_at":{"@id":"dp:occurredAt","@type":"xsd:dateTime"},"metric_id":"dp:metricId","target_metric_id":"dp:metricId","entity_id":"dp:entityId","source":"dp:source","detail":"dp:detail","question":"dp:question","persona":"dp:persona","status":"dp:status","grain":"dp:grain","event_id":{"@id":"dp:eventId","@type":"@id"},"trace_id":{"@id":"dp:traceId","@type":"@id"},"hypotheses":{"@id":"dp:hypotheses","@container":"@set"},"paths":{"@id":"dp:paths","@container":"@set"},"signed_by":"dp:signedBy","corrected_label":"dp:correctedLabel"},"id":"urn:uuid:7bb73a56-9116-44e7-a5d3-0c5061ed805e","type":"ObservationRecorded","named_graph":"urn:dataplane:graph:events:v1","occurred_at":"2026-09-01T19:34:35.499204Z","metric_id":"latency_ms","source":"telemetry","entity_id":"sensor:S100","detail":{"value":3.6,"grain":"sensor","asOf":"2026-09-01T19:34:35.499035+00:00"}}"#;
 
 #[test]
 fn jsonld_line_decodes_with_provenance_on_every_row() {
     let ipc = jsonld_to_ipc(
-        CARTRIDGE_EVENT_LINE,
+        TELEMETRY_EVENT_LINE,
         Some(&full_provenance()),
         &JsonLdLimits::default(),
         QuadLimits::default(),
@@ -490,8 +489,8 @@ fn jsonld_line_decodes_with_provenance_on_every_row() {
     );
     let named = quads.iter().any(|quad| {
         quad.subject == iri("urn:uuid:7bb73a56-9116-44e7-a5d3-0c5061ed805e")
-            && quad.predicate == "urn:atlas:namedGraph"
-            && quad.object == iri("urn:atlas:graph:events:v1")
+            && quad.predicate == "urn:dataplane:namedGraph"
+            && quad.object == iri("urn:dataplane:graph:events:v1")
             && quad.graph.is_none()
     });
     assert!(named, "named-graph link must survive: {quads:?}");
@@ -520,7 +519,7 @@ fn jsonld_remote_context_is_refused_by_name() {
 fn jsonld_relative_iri_is_refused_rather_than_dropped() {
     // Pre-migration audit shape: a bare UUID under @id stays relative after
     // expansion, and the codec refuses instead of silently dropping the node.
-    let relative = CARTRIDGE_EVENT_LINE.replace(
+    let relative = TELEMETRY_EVENT_LINE.replace(
         "urn:uuid:7bb73a56-9116-44e7-a5d3-0c5061ed805e",
         "7bb73a56-9116-44e7-a5d3-0c5061ed805e",
     );
@@ -546,7 +545,7 @@ fn jsonld_exceeded_budget_is_a_resource_limit() {
         ..JsonLdLimits::default()
     };
     let error = jsonld_to_ipc(
-        CARTRIDGE_EVENT_LINE,
+        TELEMETRY_EVENT_LINE,
         None,
         &limits,
         QuadLimits::default(),

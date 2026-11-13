@@ -20,9 +20,9 @@
 //! - [`jelly_frames_to_quads`] — decode length-delimited Jelly stream frames
 //!   back to quad objects.
 //!
-//! All output is unsigned by construction (Atlas product invariant 7): the
-//! Arrow schema carries `atlas.assurance = "unsigned"` and nothing in this
-//! binding attaches, claims, or upgrades assurance. Every function takes an
+//! All output is unsigned by construction: the Arrow schema carries
+//! `dataplane.assurance = "unsigned"` and nothing in this binding attaches,
+//! claims, or upgrades assurance. Every function takes an
 //! optional fail-closed options object (unknown keys are typed errors); see
 //! [`convert`] for the quad object shape and `index.d.ts` for the TypeScript
 //! surface. Errors surface in JS as exceptions whose message starts with a

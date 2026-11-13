@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// ATLAS-AUTHORED FILE — NOT part of the vendored Jelly schemas.
+// DATAPLANE-AUTHORED FILE — NOT part of the vendored Jelly schemas.
 //
 // The vendored `patch.proto` (Jelly-RDF @ d1d3088274be36d761617a1228a83d5b697831d6,
 // see PROVENANCE.md) defines the Jelly-Patch messages but no gRPC service,
@@ -11,7 +11,7 @@
 // claim of wire interoperability with any upstream Jelly-Patch gRPC
 // protocol.
 syntax = "proto3";
-package atlas.dataplane.jelly.patch.v1;
+package dataplane.jelly.patch.v1;
 
 import "patch.proto";
 

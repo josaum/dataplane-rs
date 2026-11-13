@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Rust guideline compliant 2026-02-21
-//! Tonic implementation of the Atlas `PatchStreamService` and a serve helper.
+//! Tonic implementation of the dataplane `PatchStreamService` and a serve helper.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use futures::{Stream, StreamExt};
 use jelly_fast_core::proto::patch::{
     RdfPatchFrame, RdfPatchOptions,
-    atlas::{
+    grpc::{
         PatchPublish, PatchReceived, PatchSubscribe,
         patch_stream_service_server::{PatchStreamService, PatchStreamServiceServer},
     },
@@ -26,11 +26,11 @@ use crate::{
     registry::{PatchTopicRegistry, check_requested_patch_options},
 };
 
-/// Pub/sub implementation of the Atlas `PatchStreamService`.
+/// Pub/sub implementation of the dataplane `PatchStreamService`.
 ///
 /// `PublishPatches` routes each client stream to the topic named by the
 /// first publish envelope (the vendored `RdfPatchOptions` carries no
-/// stream name, so the Atlas-authored service carries the topic
+/// stream name, so the dataplane service carries the topic
 /// explicitly); the first frame must open with the patch options row.
 /// `SubscribePatches` relays frames published to a topic after the
 /// subscription was established; incompatible `requested_options` yield

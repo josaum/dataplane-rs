@@ -12,7 +12,7 @@
 //! bytes, and exceeded [`QuadLimits`] budgets surface as [`BindingError`]
 //! values, never as silent drops. Output stays unsigned by construction —
 //! this module only moves data through `quad-fast-core` and
-//! `jelly-fast-core`, which pin `atlas.assurance = "unsigned"` metadata and
+//! `jelly-fast-core`, which pin `dataplane.assurance = "unsigned"` metadata and
 //! never promote assurance.
 //!
 //! Jelly frames are exchanged as *non-delimited* protobuf-encoded

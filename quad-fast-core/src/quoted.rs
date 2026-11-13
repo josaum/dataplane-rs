@@ -69,10 +69,10 @@
 //!
 //! # Contract version
 //!
-//! `atlas.contract_version` stays `"1"`. The Arrow schema is byte-identical to
+//! `dataplane.contract_version` stays `"1"`. The Arrow schema is byte-identical to
 //! the pre-RDF-star schema: no field, type, nullability, or metadata entry
-//! changed, so every existing validator in this workspace (and
-//! `atlas-reasoner`'s `atlas.arrow_version` pin, which governs the Arrow
+//! changed, so every existing validator in this workspace (and downstream
+//! consumers' `dataplane.arrow_version` pin, which governs the Arrow
 //! format, not the term vocabulary) keeps accepting these batches, and batches
 //! written before this change decode unchanged. What changed is the *value*
 //! vocabulary of the `object_kind` column, which is data, not schema. A minor

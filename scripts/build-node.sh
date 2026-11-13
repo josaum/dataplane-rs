@@ -11,13 +11,13 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 case "$(uname -s)" in
-  Darwin) DYLIB_EXT="dylib" ;;
-  Linux)  DYLIB_EXT="so" ;;
+  Darwin) dylib_prefix="lib"; dylib_ext="dylib" ;;
+  Linux)  dylib_prefix="lib"; dylib_ext="so" ;;
+  MINGW*|MSYS*|CYGWIN*|Windows_NT) dylib_prefix=""; dylib_ext="dll" ;;
   *) echo "unsupported OS: $(uname -s)" >&2; exit 1 ;;
 esac
 
-TARGET_DIR="$(cargo metadata --locked --no-deps --format-version 1 \
-  | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')"
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 
 CRATES=("$@")
 if [ "${#CRATES[@]}" -eq 0 ]; then
@@ -31,8 +31,8 @@ for crate in "${CRATES[@]}"; do BUILD_ARGS+=(-p "$crate"); done
 cargo build --release --locked "${BUILD_ARGS[@]}"
 
 for crate in "${CRATES[@]}"; do
-  napi_name="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["napi"]["name"])' "$crate/package.json")"
-  src="$TARGET_DIR/release/lib${napi_name}.${DYLIB_EXT}"
+  napi_name="$(node -e 'console.log(require("./" + process.argv[1]).napi.name)' "$crate/package.json")"
+  src="$TARGET_DIR/release/${dylib_prefix}${napi_name}.${dylib_ext}"
   test -f "$src" || { echo "missing $src" >&2; exit 1; }
   cp -f "$src" "$crate/${napi_name}.node"
   echo "ok $crate -> $crate/${napi_name}.node"

@@ -56,7 +56,7 @@ fn envelope(entry: u64, payload: CborValue) -> Vec<u8> {
 fn simple_document_roundtrips_with_vendored_envelope_prefix() {
     let doc = json!({
         "@context": {"name": "http://schema.org/name"},
-        "name": "Atlas"
+        "name": "Example"
     });
     let bytes = roundtrip(&doc);
     // tag 0xCB1D (0xd9 0xcb 0x1d), array(2) (0x82), registry entry 1 (0x01).
@@ -65,7 +65,7 @@ fn simple_document_roundtrips_with_vendored_envelope_prefix() {
     // "@context" compresses to key 0; the first custom term to id 100.
     assert_eq!(
         entry_value(&entries, &CborValue::Unsigned(100)),
-        CborValue::Text("Atlas".to_string())
+        CborValue::Text("Example".to_string())
     );
 }
 
@@ -113,7 +113,7 @@ fn nested_objects_language_maps_and_mixed_scalars_roundtrip() {
                        "@container": "@language"},
             "depth": "http://example.com/depth"
         },
-        "label": {"en": "Atlas", "de": ["Atlas", "Karte"]},
+        "label": {"en": "Chart", "de": ["Chart", "Karte"]},
         "depth": {
             "@value": 42,
             "@type": "http://example.com/level"

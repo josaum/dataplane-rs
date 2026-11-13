@@ -5,9 +5,9 @@
 // runtime; this file only proves the built .node addon loads and the four
 // bindings behave end to end inside Node.
 //
-// How to run (from cartridges/semantic-dataplane/dataplane-rs/quad-fast-node):
+// How to run (from quad-fast-node):
 //
-//   Option A - napi CLI (mirrors office-parsers-rs/json-fast-node):
+//   Option A - napi CLI (mirrors parsers-rs/json-fast-node):
 //     npm install @napi-rs/cli --no-save
 //     npx napi build --platform --release
 //     node smoke.test.mjs

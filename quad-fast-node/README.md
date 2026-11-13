@@ -2,14 +2,14 @@
 
 Node.js N-API bindings for [`quad-fast-core`](../quad-fast-core) (the
 `UnsignedQuadStream` v1 Arrow contract) and [`jelly-fast-core`](../jelly-fast-core)
-(the Jelly RDF frame codec). Mirrors the `office-parsers-rs/json-fast-node`
+(the Jelly RDF frame codec). Mirrors the `parsers-rs/json-fast-node`
 house pattern: napi 2 + napi-derive 2, cdylib, `napi_build::setup()`.
 
-Everything this binding produces is **unsigned by construction** (Atlas
-product invariant 7): the Arrow schema carries `atlas.assurance = "unsigned"`
-and nothing here attaches, claims, or upgrades assurance. All entry points
-are fail-closed with explicit resource limits; malformed input and unknown
-option keys are typed errors, never silent drops.
+Everything this binding produces is **unsigned by construction**: the Arrow
+schema carries `dataplane.assurance = "unsigned"` and nothing here attaches,
+claims, or upgrades assurance. All entry points are fail-closed with explicit
+resource limits; malformed input and unknown option keys are typed errors,
+never silent drops.
 
 ## Surface
 
@@ -28,7 +28,7 @@ provenance is refused unless `allowProvenanceLoss: true` is set explicitly.
 ## Build
 
 ```bash
-cd cartridges/semantic-dataplane/dataplane-rs/quad-fast-node
+cd quad-fast-node
 npm install @napi-rs/cli --no-save
 npx napi build --platform --release
 ```

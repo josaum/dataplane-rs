@@ -8,10 +8,10 @@
 //! and rejects non-conforming payloads with `INVALID_ARGUMENT`, so a batch
 //! that fails validation is never stored and never served.
 //!
-//! Everything this service stores and serves is **unsigned by construction**
-//! (Atlas product invariant 7): quads carry their provenance, but the
-//! transport never certifies a source, approves a rule, or promotes a fact.
-//! The `DoPut` receipt is informational JSON, not a signature.
+//! Everything this service stores and serves is **unsigned by construction**:
+//! quads carry their provenance, but the transport never certifies a source,
+//! approves a rule, or promotes a fact. The `DoPut` receipt is informational
+//! JSON, not a signature.
 //!
 //! # RPC surface
 //!

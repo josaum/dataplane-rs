@@ -91,7 +91,7 @@ impl Default for JellyPatchEncoderOptions {
 /// One encoder instance produces exactly one patch stream: the first
 /// frame starts with the options row, and lookup table, repeated-term,
 /// and transaction state span calls and frames (`FLAT` semantics). Output
-/// is unsigned by construction (Atlas product invariant 7).
+/// is unsigned by construction.
 ///
 /// Call [`JellyPatchEncoder::finish`] before transmitting the final frame
 /// to fail closed on a patch that ends with an open transaction.

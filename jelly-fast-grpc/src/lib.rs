@@ -9,9 +9,8 @@
 //! `jelly-fast-core` encoder and decoder so applications exchange
 //! `UnsignedQuadStream` batches directly.
 //!
-//! Everything relayed here is **unsigned by construction** (Atlas product
-//! invariant 7): the transport moves frames and never certifies, approves,
-//! or promotes their content.
+//! Everything relayed here is **unsigned by construction**: the transport
+//! moves frames and never certifies, approves, or promotes their content.
 //!
 //! The transport is codec-transparent: [`JellyClient`] passes
 //! `jelly-fast-core` encoder and decoder options straight through, so RDF
@@ -30,8 +29,8 @@
 //!
 //! The crate also serves the Jelly-Patch protocol (task graph N7) with
 //! the same pub/sub structure: [`JellyPatchStreamService`] implements the
-//! Atlas-authored `PatchStreamService` (see
-//! `jelly-fast-core/proto/atlas_patch_grpc.proto` — the vendored
+//! dataplane `PatchStreamService` (see
+//! `jelly-fast-core/proto/dataplane_patch_grpc.proto` — the vendored
 //! `patch.proto` defines no service and its options carry no topic, so
 //! the publish envelope names the topic explicitly), and
 //! [`JellyPatchClient`] composes the patch codec so applications exchange

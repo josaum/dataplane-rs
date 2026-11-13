@@ -18,9 +18,8 @@
 //!
 //! - Framing runs over the **default graph** (the `frameDefault` behavior).
 //!   Merging node maps would erase named-graph identity, which this
-//!   dataplane guarantees survives every transformation (Atlas invariant
-//!   3); named graphs are framed explicitly through `@graph` entries in the
-//!   frame.
+//!   dataplane guarantees survives every transformation; named graphs are
+//!   framed explicitly through `@graph` entries in the frame.
 //! - The API options keep their spec defaults: object embed flag `@once`,
 //!   `explicit` and `requireAll` and `omitDefault` false, blank node
 //!   pruning on, `omitGraph` on (JSON-LD 1.1 processing mode). Frames

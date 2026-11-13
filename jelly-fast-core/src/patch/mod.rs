@@ -14,10 +14,9 @@
 //! [`JellyPatchEncoderOptions::allow_provenance_loss`] is set, and decoded
 //! batches always carry null provenance.
 //!
-//! Codec output is **unsigned by construction** (Atlas product
-//! invariant 7): frames carry patch operations, RDF data, and lookup
-//! state — encoding or decoding never certifies, approves, or promotes
-//! anything.
+//! Codec output is **unsigned by construction**: frames carry patch
+//! operations, RDF data, and lookup state — encoding or decoding never
+//! certifies, approves, or promotes anything.
 //!
 //! # Scope
 //!

@@ -24,8 +24,8 @@ pub const CONTRACT_VERSION: &str = "1";
 
 /// Arrow major.minor.patch this contract is pinned to.
 ///
-/// Must match the workspace pin and the `atlas.arrow_version` used by
-/// `atlas-reasoner` contracts so IPC payloads stay byte-compatible across
+/// Must match the workspace pin and the `dataplane.arrow_version` used by
+/// downstream contracts so IPC payloads stay byte-compatible across
 /// planes.
 const ARROW_VERSION: &str = "58.3.0";
 
@@ -81,10 +81,10 @@ fn dict_utf8(name: &str, nullable: bool) -> Field {
 
 fn metadata() -> HashMap<String, String> {
     HashMap::from([
-        ("atlas.contract".into(), CONTRACT_NAME.into()),
-        ("atlas.contract_version".into(), CONTRACT_VERSION.into()),
-        ("atlas.arrow_version".into(), ARROW_VERSION.into()),
-        ("atlas.assurance".into(), "unsigned".into()),
+        ("dataplane.contract".into(), CONTRACT_NAME.into()),
+        ("dataplane.contract_version".into(), CONTRACT_VERSION.into()),
+        ("dataplane.arrow_version".into(), ARROW_VERSION.into()),
+        ("dataplane.assurance".into(), "unsigned".into()),
     ])
 }
 
@@ -123,8 +123,8 @@ pub fn quad_stream_schema() -> Arc<Schema> {
 /// Validates that `schema` is exactly the `UnsignedQuadStream` v1 contract.
 ///
 /// Field identity and the full metadata map are compared. Extra keys, a
-/// drifted `atlas.arrow_version`, or a missing `atlas.assurance` are all
-/// contract errors — the same exact-schema rule `atlas-reasoner` uses.
+/// drifted `dataplane.arrow_version`, or a missing `dataplane.assurance` are all
+/// contract errors — the same exact-schema rule downstream consumers use.
 ///
 /// # Errors
 ///

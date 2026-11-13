@@ -5,6 +5,16 @@
   "main": "index.js",
   "types": "index.d.ts",
   "license": "MIT",
+  "author": "Dionisio Chiuratto Agourakis",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fast-parser-inc/dataplane-rs.git",
+    "directory": "quad-fast-node"
+  },
+  "homepage": "https://github.com/fast-parser-inc/dataplane-rs#readme",
+  "bugs": {
+    "url": "https://github.com/fast-parser-inc/dataplane-rs/issues"
+  },
   "files": [
     "index.js",
     "index.d.ts",
