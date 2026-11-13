@@ -10,7 +10,17 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-jsonwebtoken = "=9.3.1"
+# jsonwebtoken 10 and later has no built-in crypto: one backend feature must
+# be on, or signing and verifying panic at run time. `aws_lc_rs`, as in
+# parsers-rs: `rust_crypto` pulls `rsa` 0.9, which carries RUSTSEC-2023-0071
+# with no fix on that line, and the audit ignores no advisory. This crate is
+# the only user, so no other member can turn on a second backend.
+jsonwebtoken = { version = "=11.1.0", features = ["aws_lc_rs"] }
+# Not used directly. The `aws_lc_rs` backend builds AWS-LC, whose x86_64
+# Windows assembly needs NASM. This feature lets that one target fall back to
+# the assembled objects the crate ships when NASM is not installed; it changes
+# nothing on other targets or where NASM is present.
+aws-lc-rs = { version = "1.15", default-features = false, features = ["prebuilt-nasm"] }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 tonic = { workspace = true }
