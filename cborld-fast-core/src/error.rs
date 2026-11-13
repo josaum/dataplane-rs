@@ -14,6 +14,8 @@ pub enum CborldResource {
     Items,
     /// Byte length of one compressed value codec payload (base58/base64).
     ValueBytes,
+    /// Bytes materialized or copied while decompressing one payload.
+    OutputBytes,
 }
 
 impl CborldResource {
@@ -25,6 +27,7 @@ impl CborldResource {
             Self::Depth => "depth",
             Self::Items => "items",
             Self::ValueBytes => "value_bytes",
+            Self::OutputBytes => "output_bytes",
         }
     }
 }

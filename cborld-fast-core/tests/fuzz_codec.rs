@@ -50,6 +50,15 @@
 
 use std::fmt::Write as _;
 
+#[path = "../../tools/mutation_smoke.rs"]
+mod smoke;
+
+/// Every test in this binary runs under the shared 1 GiB live-allocation
+/// cap, so a decoder that sizes an allocation from a hostile field aborts
+/// with a message instead of exhausting the machine.
+#[global_allocator]
+static ALLOCATOR: smoke::CappedAllocator = smoke::CappedAllocator;
+
 use cborld_fast_core::{
     CborldOptions, CompressionMode, ProvidedContexts, ProvisionalEntries,
     cbor::{CborLimits, CborValue, decode, encode_canonical},
@@ -92,6 +101,7 @@ fn fuzz_limits() -> CborLimits {
         max_depth: 16,
         max_items: 4096,
         max_value_bytes: 256,
+        ..CborLimits::default()
     }
 }
 
@@ -1264,4 +1274,57 @@ fn cross_scope_term_reuse_round_trips() {
             .any(|(key, _)| *key == CborValue::Unsigned(100)),
         "the in-scope term must still compress to an identifier: {entries:?}"
     );
+}
+
+/// Seeds for the mutation smoke: real encoder output for generated
+/// documents under the plain and registry-entry options, plus canonical
+/// encodings of generated CBOR values and hostile envelopes.
+fn smoke_seeds() -> Vec<Vec<u8>> {
+    let limits = document_limits();
+    let mut rng = Rng::new(SEEDS[0]);
+    let plain = CborldOptions {
+        limits,
+        ..CborldOptions::default()
+    };
+    let registry = CborldOptions {
+        mode: CompressionMode::RegistryEntry(100),
+        ..permissive_options(limits)
+    };
+    let mut seeds = Vec::new();
+    for _ in 0..200 {
+        let document = gen_node(&mut rng, 0, &[]);
+        for options in [&plain, &registry] {
+            if let Ok(bytes) = compress(&document, options) {
+                seeds.push(bytes);
+            }
+        }
+    }
+    for _ in 0..100 {
+        if let Ok(bytes) = encode_canonical(&gen_cbor(&mut rng, 0, &limits), &limits) {
+            seeds.push(bytes);
+        }
+        if let Ok(bytes) = encode_canonical(&gen_envelope(&mut rng, &limits), &limits) {
+            seeds.push(bytes);
+        }
+    }
+    seeds
+}
+
+/// Mutated encoder output through every public decode entry point
+/// (`cbor::decode`, and `decompress` under default and permissive options),
+/// with bytes flipped, truncated, duplicated, and inserted, on a 256 KiB
+/// thread under the 1 GiB allocation cap: no panic, no abort.
+#[test]
+fn mutation_smoke_on_a_small_stack_under_the_allocation_cap() {
+    smoke::run_on_small_stack(|| {
+        let seeds = smoke_seeds();
+        assert!(seeds.len() > 100, "only {} seeds", seeds.len());
+        let permissive = permissive_options(CborLimits::default());
+        let defaults = CborldOptions::default();
+        smoke::assert_no_panics("cborld-decoders", &seeds, 20_000, |bytes| {
+            let _ = decode(bytes, &CborLimits::default());
+            let _ = decompress(bytes, &defaults);
+            let _ = decompress(bytes, &permissive);
+        });
+    });
 }
