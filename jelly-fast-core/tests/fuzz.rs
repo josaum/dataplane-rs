@@ -82,6 +82,15 @@ use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Quad, Term, Triple};
 use prost::Message;
 use quad_fast_core::{QuadBatchBuilder, QuadLimits, QuadStreamReader};
 
+/// Stack for decoding frames nested to prost's recursion limit: 384 KiB.
+///
+/// prost 0.14 refuses messages nested deeper than 100 levels, and its
+/// decoder recurses once per level: measured on macOS arm64 unoptimized,
+/// decoding and then refusing triple terms nested 98 deep needs about
+/// 147 KiB. Windows x64 debug frames run up to twice as large, so this is
+/// the measurement times two, rounded up.
+const PROST_DEPTH_STACK_BYTES: usize = 384 * 1024;
+
 // ---------------------------------------------------------------------------
 // Deterministic PRNG
 // ---------------------------------------------------------------------------
@@ -1783,7 +1792,7 @@ fn patch_seed_corpus() -> Vec<Vec<u8>> {
 /// 1 GiB allocation cap: no panic, no abort.
 #[test]
 fn mutation_smoke_on_a_small_stack_under_the_allocation_cap() {
-    smoke::run_on_small_stack(|| {
+    smoke::run_on_stack(PROST_DEPTH_STACK_BYTES, || {
         let stream_seeds = seed_corpus();
         let first = stream_seeds.first().cloned().unwrap_or_default();
         smoke::assert_no_panics("jelly-stream", &stream_seeds, 10_000, |bytes| {

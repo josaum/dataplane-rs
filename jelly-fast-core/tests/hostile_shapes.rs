@@ -27,6 +27,15 @@ use jelly_fast_core::{
 };
 use prost::Message;
 
+/// Stack for decoding frames nested to prost's recursion limit: 384 KiB.
+///
+/// prost 0.14 refuses messages nested deeper than 100 levels, and its
+/// decoder recurses once per level: measured on macOS arm64 unoptimized,
+/// decoding and then refusing triple terms nested 98 deep needs about
+/// 147 KiB. Windows x64 debug frames run up to twice as large, so this is
+/// the measurement times two, rounded up.
+const PROST_DEPTH_STACK_BYTES: usize = 384 * 1024;
+
 fn stream_options(prefix: u32, name: u32, datatype: u32, rdf_star: bool) -> RdfStreamOptions {
     RdfStreamOptions {
         stream_name: String::new(),
@@ -266,7 +275,7 @@ fn quad_len(bytes: &[u8]) -> u64 {
 #[test]
 fn nested_quoted_triples_fail_closed_on_a_small_stack() {
     let _serial = smoke::measure_alone();
-    smoke::run_on_small_stack(|| {
+    smoke::run_on_stack(PROST_DEPTH_STACK_BYTES, || {
         for depth in [5, 8, 9, 50, 99, 100, 101, 10_000] {
             let bytes = nested_triple_bytes(depth);
             let decoded = RdfStreamFrame::decode(bytes.as_slice());

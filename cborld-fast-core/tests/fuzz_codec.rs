@@ -1310,13 +1310,23 @@ fn smoke_seeds() -> Vec<Vec<u8>> {
     seeds
 }
 
+/// Stack for codec work at the default depth of 64: 512 KiB.
+///
+/// Mutation can nest a payload up to the default depth, and the CBOR-LD
+/// codec recurses once per level: measured on macOS arm64 unoptimized,
+/// about 180 KiB at depth 64; Windows x64 debug frames run up to twice as
+/// large, so this is the measurement times two, rounded up. See
+/// `cborld_fast_core::cbor::DEFAULT_MAX_DEPTH`.
+const DEFAULT_DEPTH_STACK_BYTES: usize = 512 * 1024;
+
 /// Mutated encoder output through every public decode entry point
 /// (`cbor::decode`, and `decompress` under default and permissive options),
-/// with bytes flipped, truncated, duplicated, and inserted, on a 256 KiB
-/// thread under the 1 GiB allocation cap: no panic, no abort.
+/// with bytes flipped, truncated, duplicated, and inserted, on a thread
+/// sized for the default depth, under the 1 GiB allocation cap: no panic,
+/// no abort.
 #[test]
 fn mutation_smoke_on_a_small_stack_under_the_allocation_cap() {
-    smoke::run_on_small_stack(|| {
+    smoke::run_on_stack(DEFAULT_DEPTH_STACK_BYTES, || {
         let seeds = smoke_seeds();
         assert!(seeds.len() > 100, "only {} seeds", seeds.len());
         let permissive = permissive_options(CborLimits::default());
