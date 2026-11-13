@@ -221,3 +221,28 @@ fn extended_local_tags_that_are_not_iris_fail_closed() {
     let error = parse_yaml_ld(yaml, &extended()).expect_err("local tag");
     assert_eq!(error.code(), "profile_error");
 }
+
+/// A "billion laughs" alias bomb: nine anchors, each aliasing the previous
+/// one ten times, composes to 10^9 scalars from about 400 bytes. The
+/// Extended profile (which permits aliases) must refuse it by budget before
+/// composition instead of deep-copying every alias.
+#[test]
+fn extended_profile_alias_bomb_is_refused_by_node_budget() {
+    let mut text = String::from("a0: &a0 [x, x, x, x, x, x, x, x, x, x]\n");
+    for level in 1..10 {
+        let previous = format!("*a{}", level - 1);
+        let items = [previous.as_str(); 10].join(", ");
+        text.push_str(&format!("a{level}: &a{level} [{items}]\n"));
+    }
+    let options = YamlLdOptions {
+        profile: YamlLdProfile::Extended,
+        ..YamlLdOptions::default()
+    };
+    let started = std::time::Instant::now();
+    let error = parse_yaml_ld(&text, &options).expect_err("alias bomb is refused");
+    assert_eq!(error.code(), "resource_limit", "{error}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "refusal must not compose the bomb first"
+    );
+}

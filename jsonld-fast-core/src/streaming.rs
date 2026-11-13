@@ -527,44 +527,69 @@ fn expand_graph_node(
     }
 }
 
-fn write_value(out: &mut String, value: &Value, in_context: bool) {
-    match value {
-        Value::Null => out.push_str("null"),
-        Value::Bool(true) => out.push_str("true"),
-        Value::Bool(false) => out.push_str("false"),
-        Value::Number(number) => out.push_str(&number.to_string()),
-        Value::String(text) => push_json_string(out, text),
-        Value::Array(items) => {
-            out.push('[');
-            for (index, item) in items.iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                write_value(out, item, in_context);
-            }
-            out.push(']');
-        }
-        Value::Object(map) => write_object(out, map, in_context),
-    }
+/// One pending step of the iterative writer.
+enum WriteStep<'value> {
+    /// Serialize a value; `bool` is "nested under `@context`".
+    Value(&'value Value, bool),
+    /// Emit `"key":` (preceded by `,` unless it is the first entry).
+    Key(&'value str, bool),
+    /// Emit a punctuation character.
+    Punct(char),
 }
 
-fn write_object(out: &mut String, map: &Map<String, Value>, in_context: bool) {
-    out.push('{');
-    let keys = if in_context {
-        map.keys().cloned().collect::<Vec<_>>()
-    } else {
-        streaming_key_order(map)
-    };
-    for (index, key) in keys.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
+/// Writes `value` as JSON text with an explicit heap stack.
+///
+/// [`write_streaming_document`] returns a `String` and cannot fail, so it
+/// must not recurse on caller-built nesting: a 100,000-level value would
+/// otherwise overflow the native stack.
+fn write_value(out: &mut String, value: &Value, in_context: bool) {
+    let mut steps = vec![WriteStep::Value(value, in_context)];
+    while let Some(step) = steps.pop() {
+        match step {
+            WriteStep::Punct(ch) => out.push(ch),
+            WriteStep::Key(key, first) => {
+                if !first {
+                    out.push(',');
+                }
+                push_json_string(out, key);
+                out.push(':');
+            }
+            WriteStep::Value(current, in_context) => match current {
+                Value::Null => out.push_str("null"),
+                Value::Bool(true) => out.push_str("true"),
+                Value::Bool(false) => out.push_str("false"),
+                Value::Number(number) => out.push_str(&number.to_string()),
+                Value::String(text) => push_json_string(out, text),
+                Value::Array(items) => {
+                    out.push('[');
+                    steps.push(WriteStep::Punct(']'));
+                    for (index, item) in items.iter().enumerate().rev() {
+                        steps.push(WriteStep::Value(item, in_context));
+                        if index > 0 {
+                            steps.push(WriteStep::Punct(','));
+                        }
+                    }
+                }
+                Value::Object(map) => {
+                    out.push('{');
+                    steps.push(WriteStep::Punct('}'));
+                    let keys = if in_context {
+                        map.keys().cloned().collect::<Vec<_>>()
+                    } else {
+                        streaming_key_order(map)
+                    };
+                    for (index, key) in keys.iter().enumerate().rev() {
+                        let Some((key, child)) = map.get_key_value(key) else {
+                            continue;
+                        };
+                        let child_in_context = in_context || key == "@context";
+                        steps.push(WriteStep::Value(child, child_in_context));
+                        steps.push(WriteStep::Key(key, index == 0));
+                    }
+                }
+            },
         }
-        push_json_string(out, key);
-        out.push(':');
-        let child_in_context = in_context || key == "@context";
-        write_value(out, &map[key], child_in_context);
     }
-    out.push('}');
 }
 
 fn streaming_key_order(map: &Map<String, Value>) -> Vec<String> {

@@ -65,6 +65,9 @@ fn expand_with_mode(
     options: &JsonLdOptions,
     frame_expansion: bool,
 ) -> Result<Value, JsonLdError> {
+    // Bound the caller-built value's nesting before recursive expansion
+    // (and any recursive clone) descends into it.
+    crate::guard::check_nesting(document, options.limits.max_depth)?;
     let mut ctx = Context {
         base: options.base.clone(),
         ..Context::default()

@@ -121,7 +121,21 @@
 //! - context processing recurses on a scoped context and on a prefix
 //!   chain, neither of which is document nesting — a prefix chain is flat
 //!   JSON — so both are bounded by [`MAX_CONTEXT_RECURSION`] and refused
-//!   with [`JsonLdResource::ContextRecursion`].
+//!   with [`JsonLdResource::ContextRecursion`];
+//! - framing embeds referenced nodes inside their referrers, so a flat
+//!   chain of N nodes frames N levels deep: embedding is bounded by
+//!   [`MAX_FRAME_EMBED_DEPTH`] ([`JsonLdResource::EmbedDepth`]) and every
+//!   embedded copy is charged to [`JsonLdLimits::max_nodes`], which stops
+//!   `@embed: @always` from multiplying a shared node exponentially.
+//!
+//! Every caller-built [`serde_json::Value`] (document, frame, compaction
+//! context) is measured against [`JsonLdLimits::max_depth`] with an
+//! explicit heap stack before any recursive code — including `clone` —
+//! touches it, so a value nested 100,000 levels deep is refused instead of
+//! overflowing the native stack. Native stack use per level is large in
+//! unoptimized builds (about 17 KiB per object level in expansion), so
+//! documents *within* the default depth of 128 still need a stack of a few
+//! MiB in a debug build; run deep inputs on such a thread.
 //!
 //! # Deliberate deviations (all fail closed)
 //!
@@ -175,6 +189,7 @@ mod error;
 mod expand;
 mod frame;
 mod from_rdf;
+mod guard;
 mod iri;
 mod json_canon;
 mod node_map;
@@ -190,7 +205,7 @@ use serde_json::Value;
 pub use error::{JsonLdError, JsonLdFeature, JsonLdResource};
 pub use options::{
     DEFAULT_MAX_DEPTH, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_NODES, JsonLdLimits, JsonLdOptions,
-    MAX_CONTEXT_RECURSION,
+    MAX_CONTEXT_RECURSION, MAX_FRAME_EMBED_DEPTH,
 };
 pub use streaming::{
     ExpandStreamingGraph, STREAMING_PROFILE, StreamingGraphNodes, compact_streaming,
@@ -253,9 +268,15 @@ pub fn compact(
     context: &Value,
     options: &JsonLdOptions,
 ) -> Result<Value, JsonLdError> {
+    // The context is caller-built and is cloned below; `Clone` recurses, so
+    // its nesting is bounded before anything touches it.
+    guard::check_nesting(context, options.limits.max_depth)?;
     let expanded = expand::expand_document(document, options)?;
     let context_value = match context {
-        Value::Object(map) if map.contains_key("@context") => map["@context"].clone(),
+        Value::Object(map) => map
+            .get("@context")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(map.clone())),
         other => other.clone(),
     };
     let compacted = compact::compact_expanded(&expanded, &context_value, options)?;
@@ -273,13 +294,20 @@ pub fn compact(
 /// over the default graph; a string frame or a remote frame context is
 /// refused.
 ///
+/// Embedding is bounded by [`MAX_FRAME_EMBED_DEPTH`]. A framing that embeds
+/// more than a few levels deep is re-run on a short-lived worker thread
+/// whose stack is sized for that bound, so the caller's stack size does not
+/// limit it; the returned value can still nest that deep.
+///
 /// # Errors
 ///
 /// Returns [`JsonLdError::InvalidFrame`] and
 /// [`JsonLdError::InvalidEmbedValue`] for frame grammar violations,
 /// [`JsonLdError::RemoteContextRefused`] for
-/// remote frame contexts, and every expansion and compaction error of the
-/// document and the frame.
+/// remote frame contexts, [`JsonLdError::ResourceLimit`] with
+/// [`JsonLdResource::EmbedDepth`] or [`JsonLdResource::Nodes`] when
+/// embedding exceeds its bounds, and every expansion and compaction error
+/// of the document and the frame.
 pub fn frame(
     document: &Value,
     frame: &Value,

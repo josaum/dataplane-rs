@@ -27,12 +27,19 @@
 //! by the existing expand / compact / flatten / toRdf algorithms. Remote
 //! contexts stay refused.
 
+use std::collections::HashMap;
+
 use saphyr::{LoadableYamlNode, Scalar, Yaml};
 use saphyr_parser::{Event, Parser, Tag};
 use serde_json::{Map, Number, Value};
 
 use crate::{
-    compact, error::JsonLdError, expand, iri::is_absolute_iri, options::JsonLdOptions, to_quads,
+    compact,
+    error::{JsonLdError, JsonLdResource},
+    expand,
+    iri::is_absolute_iri,
+    options::{JsonLdLimits, JsonLdOptions},
+    to_quads,
 };
 
 use arrow_array::RecordBatch;
@@ -79,7 +86,12 @@ pub struct YamlLdOptions {
 /// # Errors
 ///
 /// Byte-budget errors, YAML composition errors, mapping-key / profile /
-/// load failures, and inf/nan refusals.
+/// load failures, and inf/nan refusals. [`JsonLdError::ResourceLimit`]
+/// with [`JsonLdResource::Depth`] when collections nest deeper than
+/// [`JsonLdLimits::max_depth`], and with [`JsonLdResource::Nodes`] when the
+/// composed stream — every alias counted as a full copy of its anchor —
+/// would exceed [`JsonLdLimits::max_nodes`]; both are checked on the event
+/// stream before anything is composed.
 pub fn parse_yaml_ld(text: &str, options: &YamlLdOptions) -> Result<Value, JsonLdError> {
     parse_yaml_ld_bytes(text.as_bytes(), options)
 }
@@ -110,9 +122,7 @@ pub fn parse_yaml_ld_bytes(bytes: &[u8], options: &YamlLdOptions) -> Result<Valu
             observed: text.len(),
         });
     }
-    if options.profile == YamlLdProfile::Basic {
-        refuse_alias_events(text)?;
-    }
+    prescan_events(text, options.profile, &options.jsonld.limits)?;
     let docs = Yaml::load_from_str(text)
         .map_err(|error| JsonLdError::YamlLoadFailed(format!("YAML parse failed: {error}")))?;
     if docs.is_empty() {
@@ -141,8 +151,12 @@ pub fn parse_yaml_ld_bytes(bytes: &[u8], options: &YamlLdOptions) -> Result<Valu
 ///
 /// # Errors
 ///
-/// [`JsonLdError::YamlLoadFailed`] when a number cannot be written as YAML.
+/// [`JsonLdError::YamlLoadFailed`] when a number cannot be written as YAML,
+/// and [`JsonLdError::ResourceLimit`] with [`crate::JsonLdResource::Depth`]
+/// when `document` nests deeper than [`crate::DEFAULT_MAX_DEPTH`] (the
+/// writer recurses once per level, so the bound is checked first).
 pub fn to_yaml_ld(document: &Value) -> Result<String, JsonLdError> {
+    crate::guard::check_nesting(document, crate::DEFAULT_MAX_DEPTH)?;
     let mut out = String::new();
     write_yaml(&mut out, document, 0)?;
     if !out.ends_with('\n') {
@@ -189,18 +203,82 @@ pub fn to_quads_yaml_ld(
     to_quads(&document, &options.jsonld, provenance)
 }
 
-/// YAML-LD Basic forbids alias nodes (`*name`). saphyr composes aliases
-/// into copies, so the composed graph no longer contains `Yaml::Alias`;
-/// the parser event stream is the only place the profile can still fail
-/// closed on the serialization that the spec forbids.
-fn refuse_alias_events(text: &str) -> Result<(), JsonLdError> {
+/// Scans the YAML event stream before saphyr composes it.
+///
+/// Composition is where YAML input amplifies, and the composed tree is
+/// where it recurses, so both are bounded here on the flat event stream:
+///
+/// - YAML-LD Basic forbids alias nodes (`*name`). saphyr composes aliases
+///   into copies, so the composed graph no longer contains `Yaml::Alias`;
+///   the event stream is the only place the profile can fail closed.
+/// - saphyr composes every alias by deep-copying the anchored node, so ten
+///   anchors that each alias the previous one ten times compose to 10^10
+///   nodes from a few hundred bytes ("billion laughs"). Each alias is
+///   charged the composed size of its anchor, and the total is held to
+///   [`JsonLdLimits::max_nodes`].
+/// - Block collections nest without a parser limit (flow collections stop
+///   at 255 in saphyr), and the composed tree is converted and dropped
+///   recursively, so collection nesting is held to
+///   [`JsonLdLimits::max_depth`] before any tree exists.
+fn prescan_events(
+    text: &str,
+    profile: YamlLdProfile,
+    limits: &JsonLdLimits,
+) -> Result<(), JsonLdError> {
+    // Open collections: (anchor id, composed count including the opener).
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    // Composed node count of each anchored node, by anchor id.
+    let mut anchored: HashMap<usize, usize> = HashMap::new();
+    let mut composed: usize = 0;
     for event in Parser::new_from_str(text) {
         let (event, _) = event
             .map_err(|error| JsonLdError::YamlLoadFailed(format!("YAML parse failed: {error}")))?;
-        if matches!(event, Event::Alias(_)) {
-            return Err(JsonLdError::YamlProfile(
-                "YAML-LD Basic profile forbids alias nodes".to_owned(),
-            ));
+        match event {
+            Event::Alias(id) => {
+                if profile == YamlLdProfile::Basic {
+                    return Err(JsonLdError::YamlProfile(
+                        "YAML-LD Basic profile forbids alias nodes".to_owned(),
+                    ));
+                }
+                let size = anchored.get(&id).copied().unwrap_or(1);
+                composed = composed.saturating_add(size);
+            }
+            Event::Scalar(_, _, anchor, _) => {
+                composed = composed.saturating_add(1);
+                if anchor != 0 {
+                    anchored.insert(anchor, 1);
+                }
+            }
+            Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
+                composed = composed.saturating_add(1);
+                open.push((anchor, composed));
+                if open.len() > limits.max_depth {
+                    return Err(JsonLdError::ResourceLimit {
+                        resource: JsonLdResource::Depth,
+                        limit: limits.max_depth,
+                        observed: open.len(),
+                    });
+                }
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                if let Some((anchor, opened)) = open.pop()
+                    && anchor != 0
+                {
+                    anchored.insert(anchor, composed.saturating_sub(opened).saturating_add(1));
+                }
+            }
+            Event::Nothing
+            | Event::StreamStart
+            | Event::StreamEnd
+            | Event::DocumentStart(_)
+            | Event::DocumentEnd => {}
+        }
+        if composed > limits.max_nodes {
+            return Err(JsonLdError::ResourceLimit {
+                resource: JsonLdResource::Nodes,
+                limit: limits.max_nodes,
+                observed: composed,
+            });
         }
     }
     Ok(())

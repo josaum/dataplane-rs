@@ -20,6 +20,12 @@ pub enum JsonLdResource {
     /// context (a scoped context, or a prefix chain in flat JSON), which
     /// the document-nesting budget cannot observe.
     ContextRecursion,
+    /// Nesting of embedded nodes reached while framing.
+    ///
+    /// Governed by [`crate::MAX_FRAME_EMBED_DEPTH`]: embedding follows
+    /// references in the node map, so a flat document of chained nodes
+    /// embeds as deep as the chain is long.
+    EmbedDepth,
 }
 
 impl JsonLdResource {
@@ -31,6 +37,7 @@ impl JsonLdResource {
             Self::Nodes => "nodes",
             Self::Depth => "depth",
             Self::ContextRecursion => "context_recursion",
+            Self::EmbedDepth => "embed_depth",
         }
     }
 }
