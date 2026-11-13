@@ -300,7 +300,8 @@ fn reassemble_lists(nodes: &mut BTreeMap<String, NodeAcc>) -> Result<(), JsonLdE
         }
     }
 
-    let (replacements, mut copied) = resolve_nested_lists(replacements, &mut consumed, nodes)?;
+    let (mut replacements, mut copied) = resolve_nested_lists(replacements, &mut consumed, nodes)?;
+    keep_unreferenced_lists(&mut replacements, &mut consumed, nodes);
 
     for (id, node) in nodes.iter_mut() {
         // Consumed chain nodes are removed below; substituting into them
@@ -341,6 +342,59 @@ fn reassemble_lists(nodes: &mut BTreeMap<String, NodeAcc>) -> Result<(), JsonLdE
         nodes.remove(id);
     }
     Ok(())
+}
+
+/// Keeps lists that nothing references as `rdf:first`/`rdf:rest` triples.
+///
+/// A converted list only survives where it is substituted: in a property
+/// of a node outside the list chains, or as an item of another list (the
+/// `rdf:first` of a chain node). A head with neither has no place to go;
+/// removing its chain would drop its triples silently, so its chain nodes
+/// are kept and it is not converted.
+fn keep_unreferenced_lists(
+    replacements: &mut ResolvedLists,
+    consumed: &mut HashSet<String>,
+    nodes: &BTreeMap<String, NodeAcc>,
+) {
+    let mut referenced: HashSet<&str> = HashSet::new();
+    for (id, node) in nodes {
+        let in_chain = consumed.contains(id);
+        for (predicate, values) in &node.properties {
+            // Outside a chain any property can hold a list; inside one only
+            // `rdf:first` (a nested list item) can.
+            let holds_items = if in_chain {
+                predicate == RDF_FIRST
+            } else {
+                predicate != RDF_REST
+            };
+            if !holds_items {
+                continue;
+            }
+            for value in values {
+                if let Some(target) = value_id(value)
+                    && replacements.contains_key(target)
+                {
+                    referenced.insert(target);
+                }
+            }
+        }
+    }
+    let unreferenced: Vec<String> = replacements
+        .keys()
+        .filter(|head| !referenced.contains(head.as_str()))
+        .cloned()
+        .collect();
+    for head in unreferenced {
+        replacements.remove(&head);
+        let mut current = head;
+        let mut seen: HashSet<String> = HashSet::new();
+        while consumed.remove(&current) && seen.insert(current.clone()) {
+            let Some(next) = nodes.get(&current).and_then(rest_id) else {
+                break;
+            };
+            current = next.to_owned();
+        }
+    }
 }
 
 /// Per-head facts gathered by [`resolve_nested_lists`].

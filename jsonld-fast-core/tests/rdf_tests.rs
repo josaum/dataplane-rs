@@ -425,3 +425,18 @@ fn nested_lists_three_deep_round_trip_without_loss() {
     let round_tripped = quads(&expanded);
     assert_eq!(quad_lines(&round_tripped), quad_lines(&original));
 }
+
+/// A well-formed list that nothing references has no place to be
+/// substituted; it must stay as `rdf:first`/`rdf:rest` triples, not vanish.
+#[test]
+fn unreferenced_list_survives_from_rdf() {
+    let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let document = json!({"@graph": [{
+        "@id": "_:l0",
+        format!("{rdf}first"): "a",
+        format!("{rdf}rest"): {"@id": format!("{rdf}nil")}
+    }]});
+    let original = quads(&document);
+    let expanded = from_quads(&original).expect("fromRdf succeeds");
+    assert_eq!(quad_lines(&quads(&expanded)), quad_lines(&original));
+}
