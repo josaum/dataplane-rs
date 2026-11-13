@@ -105,7 +105,7 @@ jobs:
           python3 -m pip install --no-index --no-deps dist/*.whl
           python3 -I -c "import importlib, os; [importlib.import_module(crate.removesuffix('-py').replace('-', '_')) for crate in os.environ['BINDINGS'].split()]"
           python3 -I -m pytest --import-mode=importlib -q quad-fast-py/tests
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
@@ -155,7 +155,7 @@ jobs:
             mv "dist-node/$crate-$version.tgz" "dist-node/$crate-$version-${{ matrix.platform }}.tgz"
           done
           ls -1 dist-node
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: node-${{ matrix.target }}
           path: dist-node/*.tgz
@@ -209,7 +209,7 @@ jobs:
             dist/SHA256SUMS
           fail_on_unmatched_files: true
           generate_release_notes: true
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release
           path: |
