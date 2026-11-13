@@ -66,7 +66,7 @@ pub use builder::{
     QuadLimits, SourceProvenance,
 };
 pub use error::{FEATURE_BASE_DIRECTION, FEATURE_TRIPLE_TERM, QuadError, QuadResource};
-pub use ipc::{DEFAULT_MAX_IPC_BYTES, read_ipc_stream, write_ipc_stream};
+pub use ipc::{DEFAULT_MAX_IPC_BYTES, preflight_ipc_message, read_ipc_stream, write_ipc_stream};
 pub use quoted::{TERM_KIND_TRIPLE, encode_triple_term, parse_triple_term, term_depth};
 pub use reader::{ProvenanceRef, QuadStreamReader};
 pub use schema::{

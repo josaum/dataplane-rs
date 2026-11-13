@@ -234,6 +234,8 @@ fn preflight_message(metadata: &[u8], saw_schema: &mut bool) -> Result<usize, Qu
             "message metadata is not a valid flatbuffer: {error}"
         ))
     })?;
+    let body_len = usize::try_from(message.bodyLength())
+        .map_err(|_ignored| malformed("message declares a negative body length"))?;
     match message.header_type() {
         MessageHeader::Schema => {
             if *saw_schema {
@@ -241,33 +243,122 @@ fn preflight_message(metadata: &[u8], saw_schema: &mut bool) -> Result<usize, Qu
             }
             *saw_schema = true;
         }
-        MessageHeader::RecordBatch => {
-            require_schema_first(*saw_schema, "record batch")?;
-            let header = message
-                .header_as_record_batch()
-                .ok_or_else(|| malformed("record batch message has no record batch header"))?;
-            reject_compression(header.compression().is_some(), "record batch")?;
+        MessageHeader::RecordBatch | MessageHeader::DictionaryBatch => {
+            require_schema_first(*saw_schema, "record or dictionary batch")?;
+            preflight_batch_header(&message, body_len)?;
         }
+        other => return Err(unsupported_header(other)),
+    }
+    Ok(body_len)
+}
+
+fn unsupported_header(header: MessageHeader) -> QuadError {
+    malformed(format!(
+        "unsupported IPC message header {:?}; an UnsignedQuadStream stream carries only \
+         schema, dictionary batch, and record batch messages",
+        header.0
+    ))
+}
+
+/// Checks a record or dictionary batch header against the body it describes.
+///
+/// Arrow slices every buffer out of the body with a slicing call that panics
+/// when the range falls outside it, and decompresses into an allocation of
+/// the size the buffer itself declares. So, before any decode:
+///
+/// * body compression is refused (the declared size is attacker-chosen);
+/// * delta dictionaries are refused (each delta re-concatenates the whole
+///   dictionary, so `n` small deltas cost `O(n^2)` copying, and no writer in
+///   this workspace emits them: `quad-fast-flight` and `write_ipc_stream`
+///   both use `DictionaryHandling::Resend`);
+/// * every length, count and offset must be non-negative, and every buffer
+///   must lie inside `body_len`.
+fn preflight_batch_header(
+    message: &arrow_ipc::Message<'_>,
+    body_len: usize,
+) -> Result<(), QuadError> {
+    let (batch, kind) = match message.header_type() {
+        MessageHeader::RecordBatch => (
+            message
+                .header_as_record_batch()
+                .ok_or_else(|| malformed("record batch message has no record batch header"))?,
+            "record batch",
+        ),
         MessageHeader::DictionaryBatch => {
-            require_schema_first(*saw_schema, "dictionary batch")?;
-            let header = message.header_as_dictionary_batch().ok_or_else(|| {
+            let dictionary = message.header_as_dictionary_batch().ok_or_else(|| {
                 malformed("dictionary batch message has no dictionary batch header")
             })?;
-            let data = header
-                .data()
-                .ok_or_else(|| malformed("dictionary batch message carries no record batch"))?;
-            reject_compression(data.compression().is_some(), "dictionary batch")?;
+            if dictionary.isDelta() {
+                return Err(malformed(
+                    "dictionary batch is a delta; delta dictionaries are refused (each one \
+                     re-copies the whole dictionary)",
+                ));
+            }
+            (
+                dictionary
+                    .data()
+                    .ok_or_else(|| malformed("dictionary batch message carries no record batch"))?,
+                "dictionary batch",
+            )
         }
-        other => {
+        other => return Err(unsupported_header(other)),
+    };
+    reject_compression(batch.compression().is_some(), kind)?;
+    if batch.length() < 0 {
+        return Err(malformed(format!("{kind} declares a negative row count")));
+    }
+    for node in batch.nodes().into_iter().flatten() {
+        if node.length() < 0 || node.null_count() < 0 {
             return Err(malformed(format!(
-                "unsupported IPC message header {:?}; an UnsignedQuadStream stream carries only \
-                 schema, dictionary batch, and record batch messages",
-                other.0
+                "{kind} declares a negative field length or null count"
             )));
         }
     }
-    usize::try_from(message.bodyLength())
-        .map_err(|_ignored| malformed("message declares a negative body length"))
+    for buffer in batch.buffers().into_iter().flatten() {
+        let end = usize::try_from(buffer.offset())
+            .ok()
+            .zip(usize::try_from(buffer.length()).ok())
+            .and_then(|(offset, length)| offset.checked_add(length));
+        match end {
+            Some(end) if end <= body_len => {}
+            _ => {
+                return Err(malformed(format!(
+                    "{kind} declares a buffer outside its {body_len}-byte body"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verifies one encapsulated IPC message that arrives on its own.
+///
+/// This is the per-message form of the stream pre-flight that
+/// [`read_ipc_stream`] runs, for transports that deliver header and body
+/// separately (an Arrow Flight `FlightData` carries `data_header` and
+/// `data_body`). Run it on every message *before* handing it to an Arrow
+/// decoder. A message with no header (`MessageHeader::NONE`, used by Flight
+/// for metadata-only frames) passes with an empty body.
+///
+/// # Errors
+///
+/// Returns [`QuadError::Ipc`] when the header is not a verifiable flatbuffer,
+/// is a message kind a contract stream never carries, declares a body
+/// compression or a delta dictionary, declares a negative length or count,
+/// or describes a buffer that lies outside `body`.
+pub fn preflight_ipc_message(metadata: &[u8], body: &[u8]) -> Result<(), QuadError> {
+    let message = root_as_message(metadata).map_err(|error| {
+        malformed(format!(
+            "message metadata is not a valid flatbuffer: {error}"
+        ))
+    })?;
+    match message.header_type() {
+        MessageHeader::NONE | MessageHeader::Schema => Ok(()),
+        MessageHeader::RecordBatch | MessageHeader::DictionaryBatch => {
+            preflight_batch_header(&message, body.len())
+        }
+        other => Err(unsupported_header(other)),
+    }
 }
 
 fn require_schema_first(saw_schema: bool, kind: &str) -> Result<(), QuadError> {
