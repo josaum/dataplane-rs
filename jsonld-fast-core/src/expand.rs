@@ -339,6 +339,14 @@ impl Expander {
                         }
                     }
                 }
+                // A `@reverse` map is built here, not by a nested object
+                // expansion: its keys (reverse property IRIs) are new
+                // strings, while its values were charged when built.
+                Value::Object(reverse) if key == "@reverse" => {
+                    for property in reverse.keys() {
+                        bytes = bytes.saturating_add(property.len());
+                    }
+                }
                 Value::Null | Value::Bool(_) | Value::Number(_) | Value::Object(_) => {}
             }
         }
@@ -993,6 +1001,9 @@ impl Expander {
                     }
                     // Spec step 13.8.3.7.6: prepend the map key to @type.
                     let expanded = expanded_index.clone().unwrap_or_else(|| index.clone());
+                    // The item was charged when it was expanded; the type
+                    // prepended from the map key is a new string.
+                    self.charge_output(expanded.len())?;
                     let mut types = vec![Value::String(expanded)];
                     match object.remove("@type") {
                         Some(Value::Array(existing)) => types.extend(existing),

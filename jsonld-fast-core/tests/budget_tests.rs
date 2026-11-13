@@ -52,3 +52,48 @@ fn long_term_name_amplification_is_refused_by_output_budget() {
     assert!(error.to_string().contains("output_bytes"), "{error}");
     println!("refused in {:?}: {error}", started.elapsed());
 }
+
+/// A term mapped to `definition` and used by 128 nodes built by `node`.
+fn term_used_128_times(definition: Value, node: impl Fn(usize) -> Value) -> Value {
+    let mut context = Map::new();
+    context.insert("t".to_owned(), definition);
+    let nodes: Vec<Value> = (0..128).map(node).collect();
+    json!({"@context": Value::Object(context), "@graph": nodes})
+}
+
+/// A reverse term whose IRI is 1 MiB lands as a key of each node's
+/// `@reverse` map: 128 MiB of keys from 1 MiB of input.
+#[test]
+fn long_reverse_iri_is_charged() {
+    let iri = format!("http://example.com/{}", "a".repeat(1 << 20));
+    let document = term_used_128_times(
+        json!({"@reverse": iri}),
+        |index| json!({"@id": format!("http://example.com/n{index}"), "t": {"@id": "http://example.com/o"}}),
+    );
+    let error = expand(&document, &JsonLdOptions::default()).expect_err("refused");
+    assert!(error.to_string().contains("output_bytes"), "{error}");
+}
+
+/// A `@type` map key `k` that expands to a 1 MiB IRI is prepended to each
+/// of 128 items' `@type`; those copies are charged where they are made.
+#[test]
+fn long_type_map_key_is_charged() {
+    let iri = format!("http://example.com/{}", "a".repeat(1 << 20));
+    let nodes: Vec<Value> = (0..128)
+        .map(|index| {
+            json!({
+                "@id": format!("http://example.com/n{index}"),
+                "t": {"k": {"@id": format!("http://example.com/o{index}")}}
+            })
+        })
+        .collect();
+    let mut context = Map::new();
+    context.insert(
+        "t".to_owned(),
+        json!({"@id": "http://example.com/p", "@container": "@type"}),
+    );
+    context.insert("k".to_owned(), Value::String(iri));
+    let document = json!({"@context": Value::Object(context), "@graph": nodes});
+    let error = expand(&document, &JsonLdOptions::default()).expect_err("refused");
+    assert!(error.to_string().contains("output_bytes"), "{error}");
+}
