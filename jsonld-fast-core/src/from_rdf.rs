@@ -17,7 +17,7 @@
 //! (`rdfDirection: i18n-datatype`); an i18n datatype without a valid
 //! `<language>_<direction>` fragment fails closed.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use arrow_array::RecordBatch;
 use oxrdf::{GraphNameRef, NamedOrBlankNodeRef, TermRef, Triple};
@@ -25,7 +25,8 @@ use quad_fast_core::{QuadLimits, QuadStreamReader};
 use serde_json::{Map, Value};
 
 use crate::{
-    error::JsonLdError,
+    error::{JsonLdError, JsonLdResource},
+    options::{DEFAULT_MAX_DEPTH, DEFAULT_MAX_NODES},
     to_rdf::{I18N_NAMESPACE, RDF_FIRST, RDF_JSON, RDF_NIL, RDF_REST, RDF_TYPE, XSD_STRING},
 };
 
@@ -90,14 +91,14 @@ pub(crate) fn quads_to_expanded(batches: &[RecordBatch]) -> Result<Value, JsonLd
     }
 
     let mut default_nodes = graphs.remove(&None).unwrap_or_default();
-    reassemble_lists(&mut default_nodes);
+    reassemble_lists(&mut default_nodes)?;
     // Every named graph needs a carrier node in the default graph.
     let named_graph_names: Vec<String> = graphs.keys().flatten().cloned().collect();
     for name in &named_graph_names {
         default_nodes.entry(name.clone()).or_default();
     }
     for graph_nodes in graphs.values_mut() {
-        reassemble_lists(graph_nodes);
+        reassemble_lists(graph_nodes)?;
     }
 
     let mut output = Vec::with_capacity(default_nodes.len());
@@ -245,7 +246,19 @@ fn render_node(id: &str, node: &NodeAcc) -> Value {
 
 /// Converts well-formed `rdf:first`/`rdf:rest` chains into `@list` arrays
 /// (JSON-LD 1.1 API section 8.4). Malformed chains are left as triples.
-fn reassemble_lists(nodes: &mut BTreeMap<String, NodeAcc>) {
+///
+/// A list item may itself be the head of a list, so lists nest. Nesting is
+/// resolved innermost-first; heads on a cycle stay as triples (their chain
+/// nodes are kept, so nothing is lost).
+///
+/// # Errors
+///
+/// [`JsonLdError::ResourceLimit`] with [`JsonLdResource::Depth`] when lists
+/// nest deeper than [`DEFAULT_MAX_DEPTH`] (flat quads would otherwise build
+/// an arbitrarily deep value), and with [`JsonLdResource::Nodes`] when the
+/// values copied into nested and shared lists exceed [`DEFAULT_MAX_NODES`]
+/// (a list head referenced twice from each level doubles per level).
+fn reassemble_lists(nodes: &mut BTreeMap<String, NodeAcc>) -> Result<(), JsonLdError> {
     let list_nodes: HashSet<String> = nodes
         .iter()
         .filter(|(_, node)| is_list_node(node))
@@ -287,44 +300,37 @@ fn reassemble_lists(nodes: &mut BTreeMap<String, NodeAcc>) {
         }
     }
 
-    // Nested lists: substitute list-head references inside collected
-    // `@list` arrays. A bounded number of passes handles nesting without
-    // looping forever on a cyclic first/rest graph we failed to classify.
-    for _ in 0..replacements.len().saturating_add(1) {
-        let lookup = replacements.clone();
-        let mut changed = false;
-        for list_object in replacements.values_mut() {
-            let Some(Value::Array(items)) = list_object.get_mut("@list") else {
-                continue;
-            };
-            for item in items {
-                let Some(id) = value_id(item) else {
-                    continue;
-                };
-                let Some(nested) = lookup.get(id) else {
-                    continue;
-                };
-                *item = nested.clone();
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    let (replacements, mut copied) = resolve_nested_lists(replacements, &mut consumed, nodes)?;
 
-    for node in nodes.values_mut() {
+    for (id, node) in nodes.iter_mut() {
+        // Consumed chain nodes are removed below; substituting into them
+        // would only spend budget.
+        if consumed.contains(id) {
+            continue;
+        }
         for (predicate, values) in &mut node.properties {
-            if predicate == RDF_REST || predicate == RDF_FIRST {
+            // `rdf:first` of a node kept as triples may reference a
+            // converted list head; substituting it there keeps the head's
+            // items, which are otherwise removed with the consumed chain.
+            let is_first = predicate == RDF_FIRST;
+            if predicate == RDF_REST {
                 continue;
             }
             for value in values {
                 let Some(id) = value_id(value) else {
                     continue;
                 };
-                if let Some(list) = replacements.get(id) {
+                if let Some((list, size)) = replacements.get(id) {
+                    copied = copied.saturating_add(*size);
+                    if copied > DEFAULT_MAX_NODES {
+                        return Err(JsonLdError::ResourceLimit {
+                            resource: JsonLdResource::Nodes,
+                            limit: DEFAULT_MAX_NODES,
+                            observed: copied,
+                        });
+                    }
                     *value = list.clone();
-                } else if id == RDF_NIL {
+                } else if id == RDF_NIL && !is_first {
                     *value = empty_list();
                 }
             }
@@ -334,6 +340,168 @@ fn reassemble_lists(nodes: &mut BTreeMap<String, NodeAcc>) {
     for id in &consumed {
         nodes.remove(id);
     }
+    Ok(())
+}
+
+/// Per-head facts gathered by [`resolve_nested_lists`].
+#[derive(Debug, Default)]
+struct HeadFacts {
+    /// Nesting depth of the head's list (1 for a list of plain items).
+    depth: usize,
+    /// Values its fully resolved list holds, nested lists included.
+    size: usize,
+}
+
+/// Resolved list objects by head id, with the values each one holds.
+type ResolvedLists = BTreeMap<String, (Value, usize)>;
+
+/// Substitutes nested list heads inside `replacements`, innermost first.
+///
+/// Iterative post-order over the "item is a list head" graph: no native
+/// recursion, every head resolved once. Heads on a cycle are dropped from
+/// `replacements` and their chains un-consumed, so they stay as triples.
+fn resolve_nested_lists(
+    replacements: BTreeMap<String, Value>,
+    consumed: &mut HashSet<String>,
+    nodes: &BTreeMap<String, NodeAcc>,
+) -> Result<(ResolvedLists, usize), JsonLdError> {
+    let children = |head: &str| -> Vec<String> {
+        replacements
+            .get(head)
+            .and_then(|list| list.get("@list"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(value_id)
+                    .filter(|id| replacements.contains_key(*id))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // Post-order with cycle detection (white / on-stack / done).
+    let mut facts: HashMap<String, HeadFacts> = HashMap::new();
+    let mut on_stack: HashSet<String> = HashSet::new();
+    let mut cyclic: HashSet<String> = HashSet::new();
+    let mut order: Vec<String> = Vec::new();
+    for root in replacements.keys() {
+        if facts.contains_key(root) {
+            continue;
+        }
+        let mut stack: Vec<(String, bool)> = vec![(root.clone(), false)];
+        while let Some((head, expanded)) = stack.pop() {
+            if expanded {
+                on_stack.remove(&head);
+                let mut depth = 1_usize;
+                let mut size = 1_usize;
+                let mut items = 0_usize;
+                for child in children(&head) {
+                    items = items.saturating_add(1);
+                    match facts.get(&child) {
+                        Some(child_facts) if !cyclic.contains(&child) => {
+                            depth = depth.max(child_facts.depth.saturating_add(1));
+                            size = size.saturating_add(child_facts.size);
+                        }
+                        _ => {}
+                    }
+                }
+                let plain = replacements
+                    .get(&head)
+                    .and_then(|list| list.get("@list"))
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len)
+                    .saturating_sub(items);
+                size = size.saturating_add(plain);
+                if depth > DEFAULT_MAX_DEPTH {
+                    return Err(JsonLdError::ResourceLimit {
+                        resource: JsonLdResource::Depth,
+                        limit: DEFAULT_MAX_DEPTH,
+                        observed: depth,
+                    });
+                }
+                if size > DEFAULT_MAX_NODES {
+                    return Err(JsonLdError::ResourceLimit {
+                        resource: JsonLdResource::Nodes,
+                        limit: DEFAULT_MAX_NODES,
+                        observed: size,
+                    });
+                }
+                facts.insert(head.clone(), HeadFacts { depth, size });
+                order.push(head);
+                continue;
+            }
+            if facts.contains_key(&head) {
+                continue;
+            }
+            if on_stack.contains(&head) {
+                cyclic.insert(head);
+                continue;
+            }
+            on_stack.insert(head.clone());
+            stack.push((head.clone(), true));
+            for child in children(&head) {
+                if on_stack.contains(&child) {
+                    cyclic.insert(child);
+                } else if !facts.contains_key(&child) {
+                    stack.push((child, false));
+                }
+            }
+        }
+    }
+
+    // Every resolved head is materialized once and copied once per
+    // reference; charge those copies before making them.
+    let mut copied = 0_usize;
+    for (head, fact) in &facts {
+        if !cyclic.contains(head) {
+            copied = copied.saturating_add(fact.size);
+        }
+    }
+    if copied > DEFAULT_MAX_NODES {
+        return Err(JsonLdError::ResourceLimit {
+            resource: JsonLdResource::Nodes,
+            limit: DEFAULT_MAX_NODES,
+            observed: copied,
+        });
+    }
+
+    let mut remaining = replacements;
+    let mut resolved: ResolvedLists = BTreeMap::new();
+    for head in order {
+        let Some(mut list_object) = remaining.remove(&head) else {
+            continue;
+        };
+        if cyclic.contains(&head) {
+            continue;
+        }
+        if let Some(Value::Array(items)) = list_object.get_mut("@list") {
+            for item in items {
+                let Some(id) = value_id(item) else {
+                    continue;
+                };
+                if let Some((nested, _)) = resolved.get(id) {
+                    *item = nested.clone();
+                }
+            }
+        }
+        let size = facts.get(&head).map_or(0, |fact| fact.size);
+        resolved.insert(head, (list_object, size));
+    }
+
+    // Cyclic heads stay as triples: give their chain nodes back.
+    for head in &cyclic {
+        let mut current = head.clone();
+        let mut seen: HashSet<String> = HashSet::new();
+        while consumed.remove(&current) && seen.insert(current.clone()) {
+            let Some(next) = nodes.get(&current).and_then(rest_id) else {
+                break;
+            };
+            current = next.to_owned();
+        }
+    }
+    Ok((resolved, copied))
 }
 
 fn empty_list() -> Value {

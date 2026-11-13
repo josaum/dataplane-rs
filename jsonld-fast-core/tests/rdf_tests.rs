@@ -404,3 +404,24 @@ fn from_rdf_still_accepts_batches_without_triple_terms() {
     }));
     from_quads(&batches).expect("plain batches still convert");
 }
+
+/// Lists nested three deep (a list whose item is a list whose item is a
+/// list) must round-trip through `fromRdf` without losing the innermost
+/// items: every quad of the original survives a second `toRdf`.
+#[test]
+fn nested_lists_three_deep_round_trip_without_loss() {
+    let document = json!({
+        "@id": "http://example.com/s",
+        "http://example.com/p": {"@list": [
+            {"@list": [
+                {"@list": ["innermost", "items"]},
+                "middle"
+            ]},
+            "outer"
+        ]}
+    });
+    let original = quads(&document);
+    let expanded = from_quads(&original).expect("fromRdf succeeds");
+    let round_tripped = quads(&expanded);
+    assert_eq!(quad_lines(&round_tripped), quad_lines(&original));
+}
