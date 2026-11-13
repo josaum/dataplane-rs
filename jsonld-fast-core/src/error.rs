@@ -13,12 +13,13 @@ pub enum JsonLdResource {
     Nodes,
     /// Nesting depth reached during expansion.
     Depth,
-    /// Native recursion depth reached while processing a `@context`.
+    /// Context-processing depth: scoped-context recursion, or the length
+    /// of a chain of terms defined through one another.
     ///
     /// Governed by [`crate::MAX_CONTEXT_RECURSION`], not by
-    /// [`crate::JsonLdLimits`]: the recursion follows the *contents* of a
-    /// context (a scoped context, or a prefix chain in flat JSON), which
-    /// the document-nesting budget cannot observe.
+    /// [`crate::JsonLdLimits`]: both follow the *contents* of a context (a
+    /// prefix chain is flat JSON), which the document-nesting budget cannot
+    /// observe. Chains are measured on an explicit stack, not by recursion.
     ContextRecursion,
     /// Nesting of embedded nodes reached while framing.
     ///
@@ -26,6 +27,11 @@ pub enum JsonLdResource {
     /// references in the node map, so a flat document of chained nodes
     /// embeds as deep as the chain is long.
     EmbedDepth,
+    /// Bytes of strings produced by expansion (keys, IRIs, values).
+    ///
+    /// Governed by [`crate::JsonLdLimits::max_output_bytes`]: a term that
+    /// expands to a long IRI multiplies the input by every use.
+    OutputBytes,
 }
 
 impl JsonLdResource {
@@ -38,6 +44,7 @@ impl JsonLdResource {
             Self::Depth => "depth",
             Self::ContextRecursion => "context_recursion",
             Self::EmbedDepth => "embed_depth",
+            Self::OutputBytes => "output_bytes",
         }
     }
 }

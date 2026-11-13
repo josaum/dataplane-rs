@@ -11,7 +11,10 @@
 //! not expand to a keyword, an absolute IRI, or a blank node identifier are
 //! dropped, as the spec requires. Refused features abort with typed errors.
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    rc::Rc,
+};
 
 use serde_json::{Map, Value};
 
@@ -34,8 +37,9 @@ use crate::{
 pub(crate) fn expand_document(
     document: &Value,
     options: &JsonLdOptions,
+    output_budget: usize,
 ) -> Result<Value, JsonLdError> {
-    expand_with_mode(document, options, false)
+    expand_with_mode(document, options, false, output_budget)
 }
 
 /// Expands a frame document (JSON-LD 1.1 Framing section 4.1: expansion
@@ -56,14 +60,16 @@ pub(crate) fn expand_document(
 pub(crate) fn expand_frame_document(
     document: &Value,
     options: &JsonLdOptions,
+    output_budget: usize,
 ) -> Result<Value, JsonLdError> {
-    expand_with_mode(document, options, true)
+    expand_with_mode(document, options, true, output_budget)
 }
 
 fn expand_with_mode(
     document: &Value,
     options: &JsonLdOptions,
     frame_expansion: bool,
+    output_budget: usize,
 ) -> Result<Value, JsonLdError> {
     // Nesting is bounded by the caller: every public entry point that
     // reaches here (`expand`, `compact`, `to_quads`, `frame`) has already
@@ -77,6 +83,9 @@ fn expand_with_mode(
         max_nodes: options.limits.max_nodes,
         max_depth: options.limits.max_depth,
         nodes: 0,
+        output_bytes: 0,
+        max_output_bytes: output_budget,
+        scoped_cache: HashMap::new(),
         frame_expansion,
     };
     let expanded = expander.expand_element(&mut ctx, None, document, 0, false)?;
@@ -161,9 +170,60 @@ struct Expander {
     max_nodes: usize,
     max_depth: usize,
     nodes: usize,
+    /// String bytes produced so far (see [`Expander::charge_output`]).
+    output_bytes: usize,
+    /// Budget for `output_bytes`
+    /// ([`crate::JsonLdLimits::max_output_bytes`]).
+    max_output_bytes: usize,
+    /// Processed scoped contexts of this run (see [`Expander::apply_scoped`]).
+    scoped_cache: HashMap<ScopedKey, ScopedEntry>,
     /// Frame-expansion mode (JSON-LD 1.1 Framing): frame value patterns and
     /// framing keywords are accepted and preserved.
     frame_expansion: bool,
+}
+
+/// Identity of one scoped-context application: the parent scope's term
+/// map, the scoped context, and the two processing flags.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ScopedKey {
+    parent_terms: usize,
+    local: usize,
+    override_protected: bool,
+    propagate: bool,
+}
+
+/// A cached scoped-context application.
+///
+/// `parent` and `local` keep the keyed allocations alive, so their
+/// addresses cannot be reused by another map or value while the entry
+/// exists; `parent` also carries the non-term fields compared on a hit.
+#[derive(Debug)]
+struct ScopedEntry {
+    parent: Context,
+    local: Rc<Value>,
+    result: Context,
+}
+
+/// Most scoped-context applications cached per expansion run: 4,096.
+///
+/// A document normally applies a handful of distinct scoped contexts to
+/// many nodes; the bound only stops a document with ever-new parent scopes
+/// from retaining every processed context. When full, the cache is cleared
+/// (correctness never depends on a hit).
+const SCOPED_CACHE_ENTRIES: usize = 4_096;
+
+/// `true` when two contexts agree on everything but the term map, which
+/// the cache key compares by identity.
+fn same_scope_fields(left: &Context, right: &Context) -> bool {
+    left.vocab == right.vocab
+        && left.base == right.base
+        && left.default_language == right.default_language
+        && left.default_direction == right.default_direction
+        && match (&left.previous, &right.previous) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Rc::ptr_eq(left, right),
+            _ => false,
+        }
 }
 
 /// The framing keywords accepted (only) in frame expansion.
@@ -195,6 +255,113 @@ impl Expander {
         Ok(())
     }
 
+    /// Applies the term-scoped context `local` on top of `base`, reusing an
+    /// earlier identical application.
+    ///
+    /// A type- or property-scoped context is applied at every node or
+    /// property that uses its term. Reprocessing it each time made `n`
+    /// uses of an `n`-term scoped context cost `O(n^2)`; processing is a
+    /// pure function of the parent scope, the context, and the flags, so
+    /// the result is cached by their identities and shared (`Rc` term
+    /// maps make the copy O(1)).
+    fn apply_scoped(
+        &mut self,
+        base: &Context,
+        local: &Rc<Value>,
+        override_protected: bool,
+        propagate: bool,
+    ) -> Result<Context, JsonLdError> {
+        let key = ScopedKey {
+            parent_terms: Rc::as_ptr(&base.terms) as usize,
+            local: Rc::as_ptr(local) as usize,
+            override_protected,
+            propagate,
+        };
+        if let Some(entry) = self.scoped_cache.get(&key)
+            && Rc::ptr_eq(&entry.parent.terms, &base.terms)
+            && Rc::ptr_eq(&entry.local, local)
+            && same_scope_fields(&entry.parent, base)
+        {
+            return Ok(entry.result.clone());
+        }
+        let result = process_context(
+            base,
+            local,
+            self.options_base.as_deref(),
+            override_protected,
+            propagate,
+        )?;
+        if self.scoped_cache.len() >= SCOPED_CACHE_ENTRIES {
+            self.scoped_cache.clear();
+        }
+        self.scoped_cache.insert(
+            key,
+            ScopedEntry {
+                parent: base.clone(),
+                local: Rc::clone(local),
+                result: result.clone(),
+            },
+        );
+        Ok(result)
+    }
+
+    /// Charges `bytes` of produced strings to the output budget.
+    fn charge_output(&mut self, bytes: usize) -> Result<(), JsonLdError> {
+        self.output_bytes = self.output_bytes.saturating_add(bytes);
+        if self.output_bytes > self.max_output_bytes {
+            return Err(JsonLdError::ResourceLimit {
+                resource: crate::error::JsonLdResource::OutputBytes,
+                limit: self.max_output_bytes,
+                observed: self.output_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    /// Charges the strings an expanded object holds directly: its keys,
+    /// string values, and strings directly inside its arrays.
+    ///
+    /// Each object expansion builds is charged once, when it is built;
+    /// nested objects were charged when they were built, so they are not
+    /// descended into. This covers expanded property IRIs, `@id` and
+    /// `@type` IRIs (including `@vocab`/`@base` resolution), and value
+    /// objects with their coerced `@type`.
+    fn charge_object(&mut self, map: &Map<String, Value>) -> Result<(), JsonLdError> {
+        let mut bytes = 0_usize;
+        for (key, value) in map {
+            bytes = bytes.saturating_add(key.len());
+            match value {
+                Value::String(text) => bytes = bytes.saturating_add(text.len()),
+                Value::Array(items) => {
+                    for item in items {
+                        if let Value::String(text) = item {
+                            bytes = bytes.saturating_add(text.len());
+                        }
+                    }
+                }
+                // A `@reverse` map is built here, not by a nested object
+                // expansion: its keys (reverse property IRIs) are new
+                // strings, while its values were charged when built.
+                Value::Object(reverse) if key == "@reverse" => {
+                    for property in reverse.keys() {
+                        bytes = bytes.saturating_add(property.len());
+                    }
+                }
+                Value::Null | Value::Bool(_) | Value::Number(_) | Value::Object(_) => {}
+            }
+        }
+        self.charge_output(bytes)
+    }
+
+    /// Charges a value object produced from a scalar.
+    fn charge_value(&mut self, value: &Value) -> Result<(), JsonLdError> {
+        match value {
+            Value::Object(map) => self.charge_object(map),
+            Value::String(text) => self.charge_output(text.len()),
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => Ok(()),
+        }
+    }
+
     /// Charges a `@json` literal payload to the node and depth budgets.
     ///
     /// Spec step 13.7 copies the value of a `@json`-typed entry verbatim,
@@ -216,8 +383,14 @@ impl Expander {
             let child = level.saturating_add(1);
             match node {
                 Value::Array(items) => pending.extend(items.iter().map(|item| (item, child))),
-                Value::Object(map) => pending.extend(map.values().map(|item| (item, child))),
-                _ => {}
+                Value::Object(map) => {
+                    let keys: usize = map.keys().map(String::len).sum();
+                    self.charge_output(keys)?;
+                    pending.extend(map.values().map(|item| (item, child)));
+                }
+                // The payload is copied verbatim: charge its strings too.
+                Value::String(text) => self.charge_output(text.len())?,
+                Value::Null | Value::Bool(_) | Value::Number(_) => {}
             }
         }
         Ok(())
@@ -246,7 +419,13 @@ impl Expander {
                 }
                 Ok(Some(Value::Array(expanded)))
             }
-            Value::Object(map) => self.expand_object(ctx, active_property, map, depth, from_map),
+            Value::Object(map) => {
+                let expanded = self.expand_object(ctx, active_property, map, depth, from_map)?;
+                if let Some(Value::Object(object)) = &expanded {
+                    self.charge_object(object)?;
+                }
+                Ok(expanded)
+            }
             scalar => {
                 if free_floating {
                     // Spec section 5.1.2 step 4.1: free-floating scalars drop.
@@ -260,11 +439,14 @@ impl Expander {
                     .get(property)
                     .and_then(|definition| definition.local_context.clone());
                 if let Some(local) = scoped {
-                    let mut scoped_ctx =
-                        process_context(ctx, &local, self.options_base.as_deref(), true, true)?;
-                    return Ok(Some(expand_value(&mut scoped_ctx, property, scalar)?));
+                    let mut scoped_ctx = self.apply_scoped(ctx, &local, true, true)?;
+                    let value = expand_value(&mut scoped_ctx, property, scalar)?;
+                    self.charge_value(&value)?;
+                    return Ok(Some(value));
                 }
-                Ok(Some(expand_value(ctx, property, scalar)?))
+                let value = expand_value(ctx, property, scalar)?;
+                self.charge_value(&value)?;
+                Ok(Some(value))
             }
         }
     }
@@ -309,7 +491,7 @@ impl Expander {
         if let Some(local) = &property_scoped {
             let next = {
                 let base = current(&mut owned, parent);
-                process_context(base, local, self.options_base.as_deref(), true, true)?
+                self.apply_scoped(base, local, true, true)?
             };
             owned = Some(next);
         }
@@ -364,7 +546,7 @@ impl Expander {
                 {
                     let next = {
                         let base = current(&mut owned, parent);
-                        process_context(base, &local, self.options_base.as_deref(), false, false)?
+                        self.apply_scoped(base, &local, false, false)?
                     };
                     owned = Some(next);
                 }
@@ -551,6 +733,11 @@ impl Expander {
             } else if container.language && value.is_object() {
                 let value_map = value.as_object().expect("checked is_object");
                 items = expand_language_map(key, value_map)?;
+                // Built by hand, not by a nested expansion: charge each value
+                // object, whose `@language` copies the map key per value.
+                for item in &items {
+                    self.charge_value(item)?;
+                }
             } else if container.is_map_container() && value.is_object() {
                 let value_map = value.as_object().expect("checked is_object");
                 items = self.expand_map_container(ctx, key, &definition, value_map, depth)?;
@@ -738,7 +925,7 @@ impl Expander {
                 if let Some(local) = local {
                     let next = {
                         let base = current(&mut owned_map_ctx, ctx);
-                        process_context(base, &local, self.options_base.as_deref(), false, true)?
+                        self.apply_scoped(base, &local, false, true)?
                     };
                     owned_map_ctx = Some(next);
                 }
@@ -766,6 +953,7 @@ impl Expander {
                 // Spec step 13.8.3.7.1: inside @id/@index maps combined with
                 // @graph, items become graph objects unless they already are.
                 if container.graph && !item.as_object().is_some_and(is_graph_object) {
+                    self.charge_output("@graph".len())?;
                     item = Value::Object(Map::from_iter([(
                         "@graph".to_owned(),
                         Value::Array(vec![item]),
@@ -781,6 +969,15 @@ impl Expander {
                     // with the index-mapping property (section 4.6.1.1).
                     if !is_none_index && !object.contains_key("@index") {
                         if let Some(index_iri) = &definition.index {
+                            // The item was charged when it was expanded: the
+                            // index property IRI (a key) and the copied map
+                            // key (its value) are new strings.
+                            self.charge_output(
+                                index_iri
+                                    .len()
+                                    .saturating_add("@value".len())
+                                    .saturating_add(index.len()),
+                            )?;
                             let index_value = Value::Object(Map::from_iter([(
                                 "@value".to_owned(),
                                 Value::String(index.clone()),
@@ -792,6 +989,7 @@ impl Expander {
                                 existing.push(index_value);
                             }
                         } else {
+                            self.charge_output("@index".len().saturating_add(index.len()))?;
                             object.insert("@index".to_owned(), Value::String(index.clone()));
                         }
                     }
@@ -809,6 +1007,9 @@ impl Expander {
                         let id = document_relative_index
                             .clone()
                             .unwrap_or_else(|| index.clone());
+                        // The map key expands (through a prefix, say) to an
+                        // `@id` the already-charged item did not hold.
+                        self.charge_output("@id".len().saturating_add(id.len()))?;
                         object.insert("@id".to_owned(), Value::String(id));
                     }
                 } else if container.type_ && !is_none_index {
@@ -819,6 +1020,9 @@ impl Expander {
                     }
                     // Spec step 13.8.3.7.6: prepend the map key to @type.
                     let expanded = expanded_index.clone().unwrap_or_else(|| index.clone());
+                    // The item was charged when it was expanded; the type
+                    // prepended from the map key is a new string.
+                    self.charge_output(expanded.len())?;
                     let mut types = vec![Value::String(expanded)];
                     match object.remove("@type") {
                         Some(Value::Array(existing)) => types.extend(existing),

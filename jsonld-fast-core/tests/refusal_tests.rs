@@ -635,3 +635,18 @@ fn malformed_json_is_refused() {
         .expect_err("malformed JSON must fail");
     assert_eq!(error.code(), "invalid_json");
 }
+
+/// A protected term named by a compact IRI (`"a:b"`) must stay protected
+/// when another term's IRI makes the processor define it first; redefining
+/// it in a later context is a protected-term error (pyld agrees).
+#[test]
+fn protected_compact_iri_term_defined_through_a_reference_stays_protected() {
+    let error = expand_err(json!({
+        "@context": [
+            {"@protected": true, "T": {"@id": "a:b"}, "a": "http://x/", "a:b": "http://x/b"},
+            {"a:b": {"@id": "http://x/b", "@type": "@id"}}
+        ],
+        "@id": "http://example.com/s"
+    }));
+    assert_eq!(error.code(), "protected_term", "{error}");
+}

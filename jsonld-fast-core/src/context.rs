@@ -13,7 +13,10 @@
 //! `@direction`, `@nest` values, and the full 1.1 `@container` grammar
 //! including `@language` maps and property-based `@index` (section 4.6.1.1).
 
-use std::{collections::HashMap, rc::Rc};
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use serde_json::{Map, Value};
 
@@ -221,7 +224,10 @@ pub(crate) struct TermDefinition {
     pub(crate) nest: Option<String>,
     /// Scoped (embedded) context, stored raw and re-applied at expansion
     /// time (JSON-LD 1.1 API section 4.2.2 step 21).
-    pub(crate) local_context: Option<Value>,
+    ///
+    /// Shared (`Rc`), so copying a definition per node is O(1), and its
+    /// address identifies it for the expander's scoped-context cache.
+    pub(crate) local_context: Option<Rc<Value>>,
 }
 
 impl TermDefinition {
@@ -243,7 +249,11 @@ impl TermDefinition {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Context {
     /// Term definitions, including keyword aliases.
-    pub(crate) terms: HashMap<String, TermDefinition>,
+    ///
+    /// Copy-on-write (`Rc`): cloning a context per node is O(1), and only
+    /// context processing, which defines terms, makes a private copy. The
+    /// map's address identifies the scope for the scoped-context cache.
+    pub(crate) terms: Rc<HashMap<String, TermDefinition>>,
     /// `@vocab` mapping.
     pub(crate) vocab: Option<String>,
     /// `@base` IRI.
@@ -482,7 +492,7 @@ fn process_context_object(
         .filter(|key| !CONTROL_KEYS.contains(&key.as_str()))
         .collect();
     terms.sort();
-    for term in terms {
+    for term in dependency_order(map, &terms)? {
         create_term_definition(
             result,
             map,
@@ -494,6 +504,124 @@ fn process_context_object(
         )?;
     }
     Ok(())
+}
+
+/// Orders `terms` so that every term comes after the terms of the same
+/// local context it depends on.
+///
+/// Creating a term definition defines its dependencies first (a compact
+/// IRI's prefix, or a term referenced by another term's IRI), recursively;
+/// a flat chain `{"t0": "t1:x", "t1": "t2:x", ...}` would recurse once per
+/// link, which no document-nesting budget sees. Visiting dependencies
+/// first, with an explicit stack, leaves each creation at most one level
+/// of recursion for such chains. Cycles are not followed here; creating
+/// their definitions still reports the cyclic IRI mapping as an error.
+///
+/// Behaviour change: before this ordering, a term was defined when first
+/// needed, so a dependency reached through another term's IRI could be
+/// defined by the recursive path, which does not apply `@protected`.
+/// Defining dependencies first, on the normal path, keeps their
+/// `@protected` flag; some protected-term outcomes therefore differ from
+/// earlier releases, matching pyld in the cases checked.
+///
+/// Chain length is still bounded by [`MAX_CONTEXT_RECURSION`]: when every
+/// link is a prefix (`"t0": "t1:x/"`), each IRI is longer than the next and
+/// a chain of `n` links holds `O(n^2)` bytes of IRIs (600 MB from about
+/// 500 KB at 20,000 links). The bound is enforced here, on the explicit
+/// stack, before any definition is created.
+///
+/// # Errors
+///
+/// [`JsonLdError::ResourceLimit`] with [`JsonLdResource::ContextRecursion`]
+/// when a dependency chain is longer than [`MAX_CONTEXT_RECURSION`].
+fn dependency_order<'map>(
+    map: &'map Map<String, Value>,
+    terms: &[&'map String],
+) -> Result<Vec<&'map String>, JsonLdError> {
+    let mut order: Vec<&String> = Vec::with_capacity(terms.len());
+    let mut chain: HashMap<&str, usize> = HashMap::new();
+    let mut visiting: HashSet<&str> = HashSet::new();
+    for &root in terms {
+        let mut stack: Vec<(&String, bool)> = vec![(root, false)];
+        while let Some((term, finished)) = stack.pop() {
+            if finished {
+                visiting.remove(term.as_str());
+                if !chain.contains_key(term.as_str()) {
+                    let length = term_dependencies(map, term)
+                        .iter()
+                        .filter_map(|dependency| chain.get(dependency.as_str()))
+                        .max()
+                        .map_or(1, |longest| longest.saturating_add(1));
+                    if length > MAX_CONTEXT_RECURSION {
+                        return Err(JsonLdError::ResourceLimit {
+                            resource: JsonLdResource::ContextRecursion,
+                            limit: MAX_CONTEXT_RECURSION,
+                            observed: length,
+                        });
+                    }
+                    chain.insert(term.as_str(), length);
+                    order.push(term);
+                }
+                continue;
+            }
+            if chain.contains_key(term.as_str()) || !visiting.insert(term.as_str()) {
+                continue;
+            }
+            stack.push((term, true));
+            for dependency in term_dependencies(map, term) {
+                if !chain.contains_key(dependency.as_str())
+                    && !visiting.contains(dependency.as_str())
+                {
+                    stack.push((dependency, false));
+                }
+            }
+        }
+    }
+    Ok(order)
+}
+
+/// Terms of the same local context that defining `term` would define first.
+fn term_dependencies<'map>(map: &'map Map<String, Value>, term: &str) -> Vec<&'map String> {
+    let mut references: Vec<&str> = Vec::new();
+    if let Some((prefix, _)) = term.split_once(':') {
+        references.push(prefix);
+    }
+    match map.get(term) {
+        Some(Value::String(iri)) => references.push(iri),
+        Some(Value::Object(definition)) => {
+            for keyword in ["@id", "@reverse", "@type", "@index"] {
+                if let Some(Value::String(iri)) = definition.get(keyword) {
+                    references.push(iri);
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut dependencies = Vec::new();
+    for reference in references {
+        // A reference that is itself a term of this context (`"a:b"` as a
+        // key) is defined through it: define it first, on the normal path,
+        // so it keeps its `@protected` flag (the recursive path in IRI
+        // expansion defines terms unprotected).
+        if reference != term
+            && let Some((key, _)) = map.get_key_value(reference)
+            && !CONTROL_KEYS.contains(&key.as_str())
+        {
+            dependencies.push(key);
+        }
+        let name = reference
+            .split_once(':')
+            .map_or(reference, |(prefix, _)| prefix);
+        if name == term || name.starts_with('@') {
+            continue;
+        }
+        if let Some((key, _)) = map.get_key_value(name)
+            && !CONTROL_KEYS.contains(&key.as_str())
+        {
+            dependencies.push(key);
+        }
+    }
+    dependencies
 }
 
 /// Creates the definition of `term` from `local`, recursing on dependencies.
@@ -748,7 +876,7 @@ fn create_term_definition(
     // result is discarded) and stored raw for re-application at expansion.
     if let Some(scoped) = entries.get("@context") {
         validate_scoped_context(ctx, term, scoped, depth)?;
-        definition.local_context = Some(scoped.clone());
+        definition.local_context = Some(Rc::new(scoped.clone()));
     }
 
     // Spec section 4.2.2 step 23: `@nest` must be `@nest` itself or a value
@@ -913,7 +1041,7 @@ fn store_definition(
         }
         definition.protected = true;
     }
-    ctx.terms.insert(term.to_owned(), definition);
+    Rc::make_mut(&mut ctx.terms).insert(term.to_owned(), definition);
     defined.insert(term.to_owned(), true);
     Ok(())
 }

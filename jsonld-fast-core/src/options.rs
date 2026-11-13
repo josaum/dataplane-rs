@@ -34,7 +34,10 @@ pub const DEFAULT_MAX_DEPTH: usize = 128;
 ///   section 4.2.2 step 21.2), and
 /// - a term definition created to resolve another term's prefix (section
 ///   4.2.2 step 14, via IRI expansion) — `{"a": "b:x", "b": "c:x", ...}`
-///   is **flat** JSON of arbitrary chain length.
+///   is **flat** JSON of arbitrary chain length. Terms of one local context
+///   are now defined dependencies-first with an explicit stack, so such a
+///   chain no longer recurses; the bound still covers dependencies the
+///   ordering does not see.
 ///
 /// Both are refused past this depth with
 /// [`crate::JsonLdError::ResourceLimit`] and
@@ -70,6 +73,28 @@ pub(crate) const FRAME_STACK_PER_EMBED_LEVEL: usize = 128 * 1024;
 /// Fixed native stack of the framing worker, for the non-recursive frames.
 pub(crate) const FRAME_WORKER_BASE_STACK: usize = 1024 * 1024;
 
+/// Output bytes allowed per byte of input when no explicit
+/// [`JsonLdLimits::max_output_bytes`] is set: 32.
+///
+/// Only produced strings are charged (keys, IRIs, values), not
+/// punctuation. Dense data with one-letter keys that expand to long IRIs
+/// is the legitimate worst case. Measured on optimized builds: 1,000,000
+/// nodes with 8 one-letter keys coerced to `xsd:integer` under a
+/// 70-character namespace (66 MB of input text) need between 12 and 16
+/// times their input; a schema.org-like graph of 150,000 people (47 MB)
+/// needs less than 4. 32 leaves about twice the densest measured need.
+/// Amplification attacks run at 128 times their input (a 1 MiB IRI used
+/// 128 times) to over 1,000 times (2,000 `@id`-map keys through a 64 KiB
+/// prefix) and are refused.
+pub const OUTPUT_BYTES_PER_INPUT_BYTE: usize = 32;
+
+/// Output bytes always allowed regardless of input size: 16 MiB.
+///
+/// Small documents legitimately expand by more than
+/// [`OUTPUT_BYTES_PER_INPUT_BYTE`] (a one-letter term becomes a 30-byte
+/// IRI); the floor keeps every such document well inside the budget.
+pub const OUTPUT_BYTES_FLOOR: usize = 16 * 1024 * 1024;
+
 /// Fail-closed limits for one JSON-LD processing run.
 #[derive(Clone, Copy, Debug)]
 pub struct JsonLdLimits {
@@ -79,6 +104,25 @@ pub struct JsonLdLimits {
     pub max_nodes: usize,
     /// Maximum nesting depth reached during expansion.
     pub max_depth: usize,
+    /// Maximum bytes of strings expansion may produce (expanded keys and
+    /// IRIs, `@vocab`/`@base` resolutions, and copied values).
+    ///
+    /// `None` (the default) derives the budget from the input:
+    /// [`OUTPUT_BYTES_PER_INPUT_BYTE`] times its estimated serialized size,
+    /// plus [`OUTPUT_BYTES_FLOOR`]. `Some(bytes)` sets it outright.
+    pub max_output_bytes: Option<usize>,
+}
+
+impl JsonLdLimits {
+    /// The output budget for an input of about `input_bytes` bytes.
+    #[must_use]
+    pub fn output_budget(&self, input_bytes: usize) -> usize {
+        self.max_output_bytes.unwrap_or_else(|| {
+            input_bytes
+                .saturating_mul(OUTPUT_BYTES_PER_INPUT_BYTE)
+                .saturating_add(OUTPUT_BYTES_FLOOR)
+        })
+    }
 }
 
 impl Default for JsonLdLimits {
@@ -87,6 +131,7 @@ impl Default for JsonLdLimits {
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
             max_nodes: DEFAULT_MAX_NODES,
             max_depth: DEFAULT_MAX_DEPTH,
+            max_output_bytes: None,
         }
     }
 }

@@ -232,6 +232,7 @@ fn fuzz_options() -> JsonLdOptions {
             max_input_bytes: 1 << 20,
             max_nodes: 20_000,
             max_depth: 64,
+            max_output_bytes: None,
         },
         quad_limits: QuadLimits {
             max_quads: 20_000,
@@ -1282,8 +1283,10 @@ fn regression_expanded_json_literal_is_charged_to_the_budget() {
 /// `{"t0":"t1:x","t1":"t2:x",…}` is depth-2 JSON, so neither
 /// `serde_json`'s own 128-level parse limit nor `JsonLdLimits::max_depth`
 /// (which counts *document* nesting) ever saw it. A 7,853-byte document
-/// that `parse_document` accepted killed the process; the chain is now
-/// bounded by `MAX_CONTEXT_RECURSION`.
+/// that `parse_document` accepted killed the process. Terms are now
+/// ordered dependencies-first on an explicit stack, and the chain length
+/// is still bounded by `MAX_CONTEXT_RECURSION` there, before any native
+/// recursion: a chain whose every link is a prefix holds quadratic bytes.
 #[test]
 fn regression_flat_prefix_chain_fails_closed() {
     let mut entries = Vec::new();
@@ -1306,6 +1309,25 @@ fn regression_flat_prefix_chain_fails_closed() {
         error.to_string().contains("context_recursion"),
         "the context-recursion budget must name itself: {error}"
     );
+}
+
+/// A chain whose every link is a prefix (`"t0": "t1:x/"`) grows each IRI
+/// by two bytes per link: 20,000 links held 600 MB of IRIs from about
+/// 500 KB of input. It is refused by chain length before any is built.
+#[test]
+fn growing_prefix_chain_is_refused_before_it_is_built() {
+    let mut entries = Vec::new();
+    let length = 20_000;
+    for index in 0..length {
+        entries.push((format!("t{index}"), text(&format!("t{}:x/", index + 1))));
+    }
+    entries.push((format!("t{length}"), text("http://example.com/")));
+    let document = object(vec![
+        ("@context".to_owned(), object(entries)),
+        ("t0".to_owned(), text("v")),
+    ]);
+    let error = expand(&document, &JsonLdOptions::default()).expect_err("refused");
+    assert!(error.to_string().contains("context_recursion"), "{error}");
 }
 
 /// Regression: nested scoped contexts recursed through

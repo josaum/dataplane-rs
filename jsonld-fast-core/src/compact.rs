@@ -22,7 +22,7 @@
 //!   value; otherwise the property compacts to a term-free key (compact IRI
 //!   or absolute IRI) with a generic wrapping, which always round-trips.
 
-use std::collections::HashMap;
+use std::{cell::Cell, collections::HashMap};
 
 use serde_json::{Map, Value};
 
@@ -53,6 +53,7 @@ pub(crate) fn compact_expanded(
     expanded: &Value,
     context_value: &Value,
     options: &JsonLdOptions,
+    output_budget: usize,
 ) -> Result<Value, JsonLdError> {
     let initial = Context {
         base: options.base.clone(),
@@ -68,6 +69,8 @@ pub(crate) fn compact_expanded(
     let compactor = Compactor {
         options_base: options.base.clone(),
         compact_arrays: options.compact_arrays,
+        output_bytes: Cell::new(0),
+        max_output_bytes: output_budget,
     };
     let compacted = compactor.compact_element(&active, None, expanded)?;
     match compacted {
@@ -367,6 +370,11 @@ pub(crate) struct Compactor {
     options_base: Option<String>,
     /// The `compactArrays` option.
     compact_arrays: bool,
+    /// String bytes produced so far (see [`Compactor::charge_output`]).
+    output_bytes: Cell<usize>,
+    /// Budget for `output_bytes`
+    /// ([`crate::JsonLdLimits::max_output_bytes`]).
+    max_output_bytes: usize,
 }
 
 impl std::fmt::Debug for Compactor {
@@ -379,6 +387,47 @@ impl std::fmt::Debug for Compactor {
 }
 
 impl Compactor {
+    /// Charges the strings a compacted element holds directly.
+    ///
+    /// Compaction can amplify as expansion does: a context term with a
+    /// long name chosen for a short IRI is copied at every use. Each object
+    /// compaction builds is charged its keys and direct strings once, when
+    /// it is built. A value that compacts to a bare string is not charged
+    /// here: it becomes a direct string of its parent, which charges it.
+    fn charge_output(&self, value: &Value) -> Result<(), JsonLdError> {
+        let mut bytes = 0_usize;
+        match value {
+            Value::String(_) => {}
+            Value::Object(map) => {
+                for (key, item) in map {
+                    bytes = bytes.saturating_add(key.len());
+                    match item {
+                        Value::String(text) => bytes = bytes.saturating_add(text.len()),
+                        Value::Array(items) => {
+                            for entry in items {
+                                if let Value::String(text) = entry {
+                                    bytes = bytes.saturating_add(text.len());
+                                }
+                            }
+                        }
+                        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Object(_) => {}
+                    }
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => {}
+        }
+        let total = self.output_bytes.get().saturating_add(bytes);
+        self.output_bytes.set(total);
+        if total > self.max_output_bytes {
+            return Err(JsonLdError::ResourceLimit {
+                resource: crate::error::JsonLdResource::OutputBytes,
+                limit: self.max_output_bytes,
+                observed: total,
+            });
+        }
+        Ok(())
+    }
+
     /// Compacts one expanded element (API section 6.1.2).
     fn compact_element(
         &self,
@@ -406,7 +455,11 @@ impl Compactor {
                     Ok(Value::Array(result))
                 }
             }
-            Value::Object(map) => self.compact_object(ctx, active_property, map),
+            Value::Object(map) => {
+                let compacted = self.compact_object(ctx, active_property, map)?;
+                self.charge_output(&compacted)?;
+                Ok(compacted)
+            }
             scalar => Ok(scalar.clone()),
         }
     }
@@ -1438,7 +1491,7 @@ fn unwrap_single(value: Value, compact_arrays: bool) -> Value {
 /// terms whose IRI mapping is a proper prefix of `var`.
 fn compact_iri_candidate(ctx: &Context, var: &str, value_is_null: bool) -> Option<String> {
     let mut best: Option<String> = None;
-    for (term, definition) in &ctx.terms {
+    for (term, definition) in ctx.terms.iter() {
         if !definition.prefix || term == "_" {
             continue;
         }

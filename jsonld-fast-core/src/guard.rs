@@ -36,28 +36,56 @@ use crate::error::{JsonLdError, JsonLdResource};
 ///
 /// [`JsonLdError::ResourceLimit`] with [`JsonLdResource::Depth`], reporting
 /// the first depth beyond `max_depth`, exactly as expansion would.
-pub(crate) fn check_nesting(value: &Value, max_depth: usize) -> Result<usize, JsonLdError> {
+pub(crate) fn check_nesting(value: &Value, max_depth: usize) -> Result<Shape, JsonLdError> {
     let mut pending: Vec<(&Value, usize)> = Vec::new();
-    let mut deepest = 0_usize;
+    let mut shape = Shape {
+        depth: 0,
+        bytes: scalar_bytes(value),
+    };
     push_if_container(&mut pending, value, 0, max_depth)?;
     while let Some((current, depth)) = pending.pop() {
-        deepest = deepest.max(depth);
+        shape.depth = shape.depth.max(depth);
         let child_depth = depth.saturating_add(1);
         match current {
             Value::Array(items) => {
                 for item in items {
+                    shape.bytes = shape.bytes.saturating_add(scalar_bytes(item));
                     push_if_container(&mut pending, item, child_depth, max_depth)?;
                 }
             }
             Value::Object(map) => {
-                for item in map.values() {
+                for (key, item) in map {
+                    // `"key":` plus the value.
+                    shape.bytes = shape
+                        .bytes
+                        .saturating_add(key.len().saturating_add(3))
+                        .saturating_add(scalar_bytes(item));
                     push_if_container(&mut pending, item, child_depth, max_depth)?;
                 }
             }
             Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
         }
     }
-    Ok(deepest)
+    Ok(shape)
+}
+
+/// What [`check_nesting`] measured about a value.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Shape {
+    /// Deepest container depth (the root is 0).
+    pub(crate) depth: usize,
+    /// Estimated serialized size in bytes (strings and keys exactly,
+    /// punctuation and numbers approximately).
+    pub(crate) bytes: usize,
+}
+
+/// Approximate serialized bytes of `value` itself, excluding children.
+fn scalar_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.len().saturating_add(2),
+        Value::Array(_) | Value::Object(_) => 2,
+        Value::Null | Value::Bool(_) | Value::Number(_) => 8,
+    }
 }
 
 /// Container depth processed on the caller's own thread.
@@ -171,7 +199,9 @@ mod tests {
 
     #[test]
     fn reports_the_deepest_container() {
-        assert_eq!(check_nesting(&json!({"a": [{"b": []}]}), 8).ok(), Some(3));
+        let shape = check_nesting(&json!({"a": [{"b": []}]}), 8).expect("within limit");
+        assert_eq!(shape.depth, 3);
+        assert!(shape.bytes >= r#"{"a":[{"b":[]}]}"#.len());
     }
 
     #[test]
