@@ -186,3 +186,20 @@ fn embed_always_over_shared_nodes_fits_the_default_budget() {
             .is_some_and(|items| items.len() == 20_000)
     );
 }
+
+/// A language map copies its key, the language tag, onto every value: a
+/// well-formed 64 KiB tag shared by 2,000 values is 128 MB of copies.
+#[test]
+fn language_map_tags_are_charged() {
+    let tag = format!("en{}", "-abcdefgh".repeat(64 * 1024 / 9));
+    let values: Vec<Value> = (0..2_000).map(|index| json!(format!("v{index}"))).collect();
+    let mut map = Map::new();
+    map.insert(tag, Value::Array(values));
+    let document = json!({
+        "@context": {"l": {"@id": "http://example.com/l", "@container": "@language"}},
+        "@id": "http://example.com/s",
+        "l": Value::Object(map)
+    });
+    let error = expand(&document, &JsonLdOptions::default()).expect_err("refused");
+    assert!(error.to_string().contains("output_bytes"), "{error}");
+}

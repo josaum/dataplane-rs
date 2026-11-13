@@ -733,6 +733,11 @@ impl Expander {
             } else if container.language && value.is_object() {
                 let value_map = value.as_object().expect("checked is_object");
                 items = expand_language_map(key, value_map)?;
+                // Built by hand, not by a nested expansion: charge each value
+                // object, whose `@language` copies the map key per value.
+                for item in &items {
+                    self.charge_value(item)?;
+                }
             } else if container.is_map_container() && value.is_object() {
                 let value_map = value.as_object().expect("checked is_object");
                 items = self.expand_map_container(ctx, key, &definition, value_map, depth)?;
