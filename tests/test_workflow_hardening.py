@@ -421,9 +421,22 @@ def test_the_ecosystem_scan_finds_a_new_manifest(tmp_path: Path):
 
 # --- each contract rejects the regression it exists for ---------------------
 
-CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0"
-CACHE = "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3"
-TOOLCHAIN = "dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master"
+def pinned_use(path: Path, action: str) -> str:
+    """The first `action@<sha> # <version>` reference in `path`.
+
+    The mutation anchors are read from the workflows rather than written
+    out, so a Dependabot bump of a pin does not break the contract tests.
+    """
+    found = re.search(rf"{re.escape(action)}@[0-9a-f]{{40}} # \S+", read(path))
+    assert found, f"{path.name} has no pinned {action}"
+    return found.group(0)
+
+
+CHECKOUT = pinned_use(CI, "actions/checkout")
+CACHE = pinned_use(CI, "Swatinem/rust-cache")
+TOOLCHAIN = pinned_use(RELEASE, "dtolnay/rust-toolchain")
+CHECKOUT_SHA = CHECKOUT.split(" #")[0]
+TOOLCHAIN_SHA = TOOLCHAIN.split(" #")[0]
 
 
 def pinned(path: Path, original: str, replacement: str) -> None:
@@ -465,10 +478,10 @@ MUTATIONS = [
     (rustdoc, CI, "cargo doc --workspace --no-deps --locked --all-features", "cargo doc -p quad-fast-core --no-deps --locked --all-features"),
     # 1. pinning
     (pinned, CI, CHECKOUT, "actions/checkout@v4"),
-    (pinned, CI, CHECKOUT, "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"),
-    (pinned, CI, CHECKOUT, "actions/checkout@11d5960a"),
+    (pinned, CI, CHECKOUT, CHECKOUT_SHA),
+    (pinned, CI, CHECKOUT, CHECKOUT_SHA[: CHECKOUT_SHA.index("@") + 9]),
     (pinned, RELEASE, TOOLCHAIN, "dtolnay/rust-toolchain@1.98.1"),
-    (pinned, RELEASE, TOOLCHAIN, "dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1"),
+    (pinned, RELEASE, TOOLCHAIN, f"{TOOLCHAIN_SHA} # v1"),
     (pinned, AUDIT, CHECKOUT, "actions/checkout@main # v4.4.0"),
     (pinned, CI, f"- uses: {CACHE}", f"- {{uses: {CACHE.split(' #')[0]}}}"),
     (toolchain, CI, "toolchain: 1.98.1", "toolchain: stable"),
