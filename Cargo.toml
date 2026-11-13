@@ -32,13 +32,18 @@ repository = "https://github.com/fast-parser-inc/dataplane-rs"
 rust-version = "1.94"
 publish = false
 
+# Shared dependency versions for every crate in this workspace.
+#
+# `arrow*` is pinned exactly, to the same version the consumers already use
+# (and parsers-rs pins): an Arrow IPC payload written here must be readable
+# there without a conversion step. Move every Arrow pin together, and only
+# when the consumers move.
 [workspace.dependencies]
-arrow = { version = "=58.3.0", features = ["ipc_compression"] }
-arrow-array = "=58.3.0"
-arrow-buffer = "=58.3.0"
-arrow-flight = "=58.3.0"
-arrow-ipc = { version = "=58.3.0", features = ["lz4", "zstd"] }
-arrow-schema = "=58.3.0"
+arrow = { version = "=58.4.1", features = ["ipc_compression"] }
+arrow-array = "=58.4.1"
+arrow-flight = "=58.4.1"
+arrow-ipc = { version = "=58.4.1", features = ["lz4", "zstd"] }
+arrow-schema = "=58.4.1"
 bytes = "1"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 futures = "0.3"
