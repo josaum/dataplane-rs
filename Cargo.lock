@@ -992,7 +992,7 @@ dependencies = [
  "oxrdf",
  "quad-fast-core",
  "saphyr",
- "saphyr-parser",
+ "saphyr-parser 0.3.3",
  "serde_json",
  "thiserror",
 ]
@@ -1812,7 +1812,7 @@ dependencies = [
  "encoding_rs",
  "hashlink",
  "ordered-float",
- "saphyr-parser",
+ "saphyr-parser 0.0.12",
  "thiserror",
 ]
 
@@ -1821,6 +1821,16 @@ name = "saphyr-parser"
 version = "0.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a0b1b76852c5643f558e7347e4de549474c3ecb7154295a189f4668428c1b453"
+dependencies = [
+ "arraydeque",
+ "thiserror",
+]
+
+[[package]]
+name = "saphyr-parser"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48cf5a82d41247a625f040af08e91008fec945bce3b0bffba992c44af092caa2"
 dependencies = [
  "arraydeque",
  "thiserror",
