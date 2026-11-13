@@ -105,12 +105,10 @@ impl ActiveContext {
         self.term_map.get(term)
     }
 
-    /// Approximate bytes held by this scope's definitions.
-    ///
-    /// Applying a context copies the scope, so callers charge this against
-    /// their output budget each time they apply one.
-    pub(crate) fn weight(&self) -> usize {
-        self.weight
+    /// Identity of the shared definition map, for caching context
+    /// applications per parent scope. Stable while `self` is alive.
+    pub(crate) fn map_identity(&self) -> usize {
+        Rc::as_ptr(&self.term_map) as usize
     }
 
     fn insert(&mut self, term: &str, def: TermDef) {
@@ -150,10 +148,14 @@ pub(crate) fn is_keyword(term: &str) -> bool {
 /// context, [`CborldError::Unsupported`] for `@context: null`, `@import`,
 /// and scoped contexts, and [`CborldError::Document`] for definitions
 /// outside the accepted shapes.
+///
+/// `copied` grows by the weight of the scope when applying the context
+/// had to copy it (any definition added), so callers can charge the copy.
 pub(crate) fn load_context(
     registry: &mut TermIdRegistry,
     active: &ActiveContext,
     context: &Value,
+    copied: &mut usize,
 ) -> Result<ActiveContext, CborldError> {
     let object = match context {
         Value::String(iri) => {
@@ -211,6 +213,9 @@ pub(crate) fn load_context(
         registry.assign(term);
         next.insert(term, def);
     }
+    if !Rc::ptr_eq(&next.term_map, &active.term_map) {
+        *copied = copied.saturating_add(next.weight);
+    }
     Ok(next)
 }
 
@@ -226,11 +231,13 @@ pub(crate) fn load_context(
 ///
 /// Returns [`CborldError::Document`] when `document` is not a JSON object,
 /// plus every error [`load_context`] produces for the content itself.
+/// `copied` accumulates the scope copies of every array element.
 pub(crate) fn load_context_document(
     registry: &mut TermIdRegistry,
     active: &ActiveContext,
     iri: &str,
     document: &Value,
+    copied: &mut usize,
 ) -> Result<ActiveContext, CborldError> {
     let Value::Object(object) = document else {
         return Err(CborldError::Document(format!(
@@ -242,12 +249,12 @@ pub(crate) fn load_context_document(
         Some(Value::Array(items)) => {
             let mut next = active.clone();
             for item in items {
-                next = load_context(registry, &next, item)?;
+                next = load_context(registry, &next, item, copied)?;
             }
             Ok(next)
         }
-        Some(wrapped) => load_context(registry, active, wrapped),
-        None => load_context(registry, active, document),
+        Some(wrapped) => load_context(registry, active, wrapped, copied),
+        None => load_context(registry, active, document, copied),
     }
 }
 

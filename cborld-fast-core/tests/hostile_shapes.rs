@@ -377,8 +377,168 @@ fn many_maximal_base58_values_are_budgeted() {
     );
     let result = decompress(&bytes, &CborldOptions::default());
     assert!(
+        is_resource(&result, "base58_work"),
+        "{:?}",
+        result.as_ref().map(|_| "decoded")
+    );
+}
+
+/// 5,000 nodes each carrying the same registered 118-term `@context`.
+///
+/// A legitimate shape (about 1 MB of JSON): re-applying a context already
+/// applied to the same parent scope must share the scope, not copy and
+/// charge it 5,000 times.
+#[test]
+fn registered_context_on_every_node_decodes_at_defaults() {
+    let _serial = smoke::measure_alone();
+    let iri = "https://example.org/contexts/v1";
+    let mut terms = Map::new();
+    for index in 0..118 {
+        terms.insert(
+            format!("t{index:03}"),
+            Value::String(format!(
+                "https://www.w3.org/ns/credentials/examples/v2/vocabulary/terms#t{index:03}"
+            )),
+        );
+    }
+    let mut provided = ProvidedContexts::new();
+    provided.insert(iri, json!({ "@context": Value::Object(terms) }));
+    let options = CborldOptions {
+        provided_contexts: provided,
+        ..CborldOptions::default()
+    };
+    let children: Vec<Value> = (0..5_000)
+        .map(|index| json!({"@context": iri, "t001": format!("value {index}")}))
+        .collect();
+    let document = json!({"@context": iri, "t000": children});
+    let bytes = cborld_fast_core::compress(&document, &options).expect("compresses");
+    let result = decompress(&bytes, &options);
+    assert_eq!(
+        result.as_ref().ok(),
+        Some(&document),
+        "{} bytes: {:?}",
+        bytes.len(),
+        result.as_ref().err()
+    );
+}
+
+/// A tiny inline context on each of 5,000 nodes under a 2,000-term scope.
+///
+/// Every application adds a definition, so the inherited scope really is
+/// copied each time; that copy is charged and refused.
+#[test]
+fn tiny_inline_context_per_node_on_a_large_scope_is_budgeted() {
+    let _serial = smoke::measure_alone();
+    let mut terms = Map::new();
+    for index in 0..2_000 {
+        terms.insert(
+            format!("p{index:05}"),
+            Value::String(format!("http://e/{index}")),
+        );
+    }
+    let mut provided = ProvidedContexts::new();
+    provided.insert("urn:big", Value::Object(terms));
+    let options = CborldOptions {
+        provided_contexts: provided,
+        ..CborldOptions::default()
+    };
+    let inline = CborValue::Map(vec![(text("x"), text("http://e/x"))]);
+    let node = CborValue::Map(vec![(CborValue::Unsigned(0), inline)]);
+    let bytes = envelope(CborValue::Map(vec![
+        (CborValue::Unsigned(0), text("urn:big")),
+        (
+            CborValue::Unsigned(FIRST_TERM_ID + 1),
+            CborValue::Array(vec![node; 5_000]),
+        ),
+    ]));
+    let result = decompress(&bytes, &options);
+    assert!(
         is_resource(&result, "output_bytes"),
         "{:?}",
         result.as_ref().map(|_| "decoded")
     );
+}
+
+/// `xsd:date` and `xsd:dateTime` integers expand to 10- and 20-byte
+/// strings and must be charged like every other expansion.
+#[test]
+fn date_and_datetime_expansion_is_charged() {
+    let _serial = smoke::measure_alone();
+    let options = CborldOptions {
+        limits: CborLimits {
+            max_output_bytes: 4096,
+            ..CborLimits::default()
+        },
+        ..CborldOptions::default()
+    };
+    for type_iri in [
+        "http://www.w3.org/2001/XMLSchema#date",
+        "http://www.w3.org/2001/XMLSchema#dateTime",
+    ] {
+        let definition = CborValue::Map(vec![
+            (text("@id"), text("http://e/d")),
+            (text("@type"), text(type_iri)),
+        ]);
+        let context = CborValue::Map(vec![(text("d"), definition)]);
+        let bytes = envelope(CborValue::Map(vec![
+            (CborValue::Unsigned(0), context),
+            (
+                CborValue::Unsigned(FIRST_TERM_ID + 1),
+                CborValue::Array(vec![CborValue::Unsigned(0); 1_000]),
+            ),
+        ]));
+        let result = decompress(&bytes, &options);
+        assert!(
+            is_resource(&result, "output_bytes"),
+            "{type_iri}: {:?}",
+            result.as_ref().map(|_| "decoded")
+        );
+    }
+}
+
+/// Base58 work is charged for multibase values and DID segments alike.
+///
+/// Debug-speed: one 200-byte value (40,000 work units) against a budget
+/// of 10,000. Fails if `charge_base58` stops charging.
+#[test]
+fn base58_work_is_charged_for_multibase_and_did_segments() {
+    let _serial = smoke::measure_alone();
+    let options = CborldOptions {
+        limits: CborLimits {
+            max_base58_work: 10_000,
+            ..CborLimits::default()
+        },
+        ..CborldOptions::default()
+    };
+    let mut value = vec![0x01_u8; 201];
+    value[0] = b'z';
+    let multibase = CborValue::Map(vec![
+        (text("@id"), text("http://e/m")),
+        (text("@type"), text("https://w3id.org/security#multibase")),
+    ]);
+    let context = CborValue::Map(vec![(text("m"), multibase)]);
+    let bytes = envelope(CborValue::Map(vec![
+        (CborValue::Unsigned(0), context),
+        (CborValue::Unsigned(FIRST_TERM_ID), CborValue::Bytes(value)),
+    ]));
+    let result = decompress(&bytes, &options);
+    assert!(
+        is_resource(&result, "base58_work"),
+        "multibase: {:?}",
+        result.as_ref().map(|_| "decoded")
+    );
+    // `@id` (keyword id 4) as did:key (prefix 1025) with a 200-byte segment.
+    let did = CborValue::Array(vec![
+        CborValue::Unsigned(1025),
+        CborValue::Bytes(vec![0x01; 200]),
+    ]);
+    let bytes = envelope(CborValue::Map(vec![(CborValue::Unsigned(4), did)]));
+    let result = decompress(&bytes, &options);
+    assert!(
+        is_resource(&result, "base58_work"),
+        "did: {:?}",
+        result.as_ref().map(|_| "decoded")
+    );
+    // Within budget, both decode.
+    assert!(decompress(&bytes, &CborldOptions::default()).is_ok());
 }

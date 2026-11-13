@@ -58,6 +58,15 @@ pub const DEFAULT_MAX_VALUE_BYTES: usize = 8 * 1024;
 /// it raises the worst-case memory and CPU one payload can demand.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Default base58 work one decompression may spend: 64 values of 6 KiB.
+///
+/// Rebuilding an `n`-byte base58 value takes on the order of `n * n` digit
+/// steps, charged as `n * n`. This default admits 64 values of 6,144
+/// bytes (about five seconds in a release build) and refuses the
+/// ~2,000 maximal values a 16 MiB payload could otherwise carry, which
+/// took over four minutes.
+pub const DEFAULT_MAX_BASE58_WORK: u64 = 64 * 6144 * 6144;
+
 /// Fail-closed limits for CBOR decoding and CBOR-LD conversion.
 #[derive(Clone, Copy, Debug)]
 pub struct CborLimits {
@@ -74,10 +83,17 @@ pub struct CborLimits {
     pub max_value_bytes: usize,
     /// Maximum bytes one CBOR-LD decompression may materialize or copy:
     /// term names and IRIs expanded from identifiers, reconstructed codec
-    /// values (base58 charged at its quadratic cost), and the term scope
-    /// copied each time a context is applied. Exceeding it is a typed
-    /// [`CborldError::ResourceLimit`] for `output_bytes`.
+    /// values and date strings, term definitions copied per entry, and the
+    /// term scope copied when a context adds definitions (a registered
+    /// context applied again to the same parent scope is shared, not
+    /// copied). Exceeding it is a typed [`CborldError::ResourceLimit`] for
+    /// `output_bytes`.
     pub max_output_bytes: usize,
+    /// Maximum base58 reconstruction work for one CBOR-LD decompression,
+    /// charged as the square of each value's byte length. This is CPU
+    /// work, not output. Exceeding it is a typed
+    /// [`CborldError::ResourceLimit`] for `base58_work`.
+    pub max_base58_work: u64,
 }
 
 impl Default for CborLimits {
@@ -88,6 +104,7 @@ impl Default for CborLimits {
             max_items: DEFAULT_MAX_ITEMS,
             max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            max_base58_work: DEFAULT_MAX_BASE58_WORK,
         }
     }
 }

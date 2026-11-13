@@ -16,6 +16,8 @@ pub enum CborldResource {
     ValueBytes,
     /// Bytes materialized or copied while decompressing one payload.
     OutputBytes,
+    /// Base58 reconstruction work (squared value lengths) in one payload.
+    Base58Work,
 }
 
 impl CborldResource {
@@ -28,6 +30,7 @@ impl CborldResource {
             Self::Items => "items",
             Self::ValueBytes => "value_bytes",
             Self::OutputBytes => "output_bytes",
+            Self::Base58Work => "base58_work",
         }
     }
 }
