@@ -158,11 +158,11 @@ fn ipc_bytes_carry_the_unsigned_assurance_metadata() {
     let schema = batches[0].schema();
     let metadata = schema.metadata();
     assert_eq!(
-        metadata.get("atlas.assurance").map(String::as_str),
+        metadata.get("dataplane.assurance").map(String::as_str),
         Some("unsigned")
     );
     assert_eq!(
-        metadata.get("atlas.contract").map(String::as_str),
+        metadata.get("dataplane.contract").map(String::as_str),
         Some("UnsignedQuadStream")
     );
 }

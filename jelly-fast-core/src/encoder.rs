@@ -198,8 +198,8 @@ pub(crate) fn check_provenance_loss(
 /// One encoder instance produces exactly one logical Jelly stream: the
 /// first frame starts with the options row, lookup table state persists
 /// across batches, and repeated-term elision spans batch boundaries.
-/// Output is unsigned by construction (Atlas product invariant 7): frames
-/// carry RDF data and lookup state, never assurance.
+/// Output is unsigned by construction: frames carry RDF data and lookup state,
+/// never assurance.
 ///
 /// # Examples
 ///

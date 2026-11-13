@@ -4,6 +4,8 @@
 //!
 //! See [`tests/w3c/PROVENANCE.md`]. Remote-context tests must fail closed.
 
+use std::path::Path;
+
 use jsonld_fast_core::{JsonLdOptions, compact, expand, from_quads, to_quads};
 use serde_json::Value;
 
@@ -15,7 +17,12 @@ fn load(path: &str) -> Value {
 }
 
 fn fixture(rel: &str) -> String {
-    format!("{}/tests/w3c/{rel}", env!("CARGO_MANIFEST_DIR"))
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("w3c")
+        .join(rel)
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[test]

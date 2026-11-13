@@ -15,8 +15,8 @@ const TEST_SECRET: &str = "quad-fast-flight-test-secret-0123456789abcdef";
 fn verifier() -> FlightRequestAuthVerifier {
     FlightRequestAuthVerifier::new(AuthConfig {
         require_auth: true,
-        issuer: Some("atlas".to_owned()),
-        audience: Some("atlas".to_owned()),
+        issuer: Some("dataplane".to_owned()),
+        audience: Some("dataplane".to_owned()),
         es256_public_key_pem: None,
         legacy_hs256_secret: Some(TEST_SECRET.to_owned()),
         allow_legacy_hs256: true,

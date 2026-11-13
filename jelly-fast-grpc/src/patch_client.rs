@@ -7,7 +7,7 @@ use jelly_fast_core::{
     PatchOp,
     proto::patch::{
         RdfPatchFrame, RdfPatchOptions,
-        atlas::{
+        grpc::{
             PatchPublish, PatchSubscribe, patch_stream_service_client::PatchStreamServiceClient,
         },
     },

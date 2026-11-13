@@ -28,7 +28,7 @@ version = "0.1.0"
 authors = ["Dionisio Chiuratto Agourakis"]
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/josaum/dataplane-rs"
+repository = "https://github.com/fast-parser-inc/dataplane-rs"
 rust-version = "1.94"
 publish = false
 
@@ -44,6 +44,7 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 futures = "0.3"
 oxrdf = { version = "0.3", features = ["rdf-12"] }
 prost = "0.14"
+protoc-bin-vendored = "3.2.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 sha2 = "0.10"

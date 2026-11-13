@@ -8,11 +8,11 @@
 //!
 //! Batches produced by this crate are **unsigned by construction**: encoding
 //! preserves term identity, named-graph identity, and source provenance, but
-//! never certifies a source, approves a rule, or promotes a fact (Atlas
-//! product invariant 7). The schema carries `atlas.assurance = "unsigned"`
-//! metadata so downstream planes cannot mistake codec output for governed
-//! facts. [`UnsignedQuadBatch`] is the sealed share unit: [`Clone`] aliases
-//! Arrow buffers and is not a signature.
+//! never certifies a source, approves a rule, or promotes a fact. The schema
+//! carries `dataplane.assurance = "unsigned"` metadata so downstream planes
+//! cannot mistake codec output for governed facts. [`UnsignedQuadBatch`] is
+//! the sealed share unit: [`Clone`] aliases Arrow buffers and is not a
+//! signature.
 //!
 //! # RDF 1.2 triple terms
 //!
@@ -20,7 +20,7 @@
 //! position under `object_kind = "triple"`, serialized into `object_value`
 //! by [`quoted`]. Subject, predicate, and graph positions never hold one:
 //! [`oxrdf`]'s RDF 1.2 term model does not admit them there. The Arrow schema
-//! and `atlas.contract_version = "1"` are unchanged, so batches written
+//! and `dataplane.contract_version = "1"` are unchanged, so batches written
 //! before this extension decode unchanged. Triple-term rows are only
 //! reachable through [`QuadStreamReader::quad_owned`]; the zero-copy
 //! [`QuadStreamReader::quad`] refuses them with a typed

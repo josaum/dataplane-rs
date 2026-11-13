@@ -112,7 +112,7 @@ fn entry_100_compresses_a_context_iri_to_its_table_identifier() {
     let options = options_for(100);
     let document = json!({
         "@context": "https://www.w3.org/ns/credentials/v2",
-        "name": "Atlas",
+        "name": "Example",
     });
     let bytes = roundtrip(&document, &options);
     assert_eq!(
@@ -129,7 +129,7 @@ fn entry_10001_compresses_the_same_iri_to_a_different_identifier() {
     let options = options_for(10001);
     let document = json!({
         "@context": "https://www.w3.org/ns/credentials/v2",
-        "name": "Atlas",
+        "name": "Example",
     });
     let bytes = roundtrip(&document, &options);
     assert_eq!(
@@ -270,7 +270,7 @@ fn every_vendored_entry_round_trips_a_document_through_its_own_tables() {
                 stand_in_context()["@context"].clone(),
             );
         }
-        document.insert("name".to_string(), json!("Atlas"));
+        document.insert("name".to_string(), json!("Example"));
         if let Some(url) = entry.sub_table(TABLE_TYPE_URL) {
             document.insert("issuer".to_string(), json!(url.entries[0].1));
         }
@@ -295,7 +295,7 @@ fn provisional_entries_are_refused_without_an_explicit_opt_in() {
     options.accepted_provisional_entries = ProvisionalEntries::new();
     let document = json!({
         "@context": "https://www.w3.org/ns/credentials/v2",
-        "name": "Atlas",
+        "name": "Example",
     });
     let error = compress(&document, &options).expect_err("compress must refuse");
     assert_eq!(error.code(), "provisional_registry_entry");
@@ -312,7 +312,7 @@ fn provisional_entries_are_refused_without_an_explicit_opt_in() {
 #[test]
 fn opting_in_to_one_provisional_entry_does_not_admit_another() {
     let bytes = compress(
-        &json!({"@context": "https://www.w3.org/ns/credentials/v2", "name": "Atlas"}),
+        &json!({"@context": "https://www.w3.org/ns/credentials/v2", "name": "Example"}),
         &options_for(10001),
     )
     .expect("compress under entry 10001");
@@ -325,7 +325,7 @@ fn opting_in_to_one_provisional_entry_does_not_admit_another() {
 fn entries_0_and_1_need_no_opt_in() {
     // The two reserved, non-provisional W3C default modes stay usable with
     // default options, unchanged by the registry work.
-    let document = json!({"@context": {"name": "http://schema.org/name"}, "name": "Atlas"});
+    let document = json!({"@context": {"name": "http://schema.org/name"}, "name": "Example"});
     let options = CborldOptions::default();
     roundtrip(&document, &options);
     let uncompressed = CborldOptions {
@@ -345,7 +345,7 @@ fn unvendored_registry_ids_are_refused_on_both_directions() {
     for id in [2, 7, 99, 10004, 31000002, 32000001] {
         let mut options = options_for(id);
         options.mode = CompressionMode::RegistryEntry(id);
-        let error = compress(&json!({"name": "Atlas"}), &options).expect_err("must refuse");
+        let error = compress(&json!({"name": "Example"}), &options).expect_err("must refuse");
         assert_eq!(
             error.code(),
             "unknown_registry_entry",
@@ -456,7 +456,7 @@ fn registered_contexts_still_require_caller_supplied_content() {
     };
     let document = json!({
         "@context": "https://www.w3.org/ns/credentials/v2",
-        "name": "Atlas",
+        "name": "Example",
     });
     let error = compress(&document, &options).expect_err("must refuse");
     assert_eq!(error.code(), "unregistered_context");

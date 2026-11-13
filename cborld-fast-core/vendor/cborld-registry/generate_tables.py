@@ -120,7 +120,7 @@ def main() -> int:
         out.append("    },")
     out.append("];")
     out.append("")
-    OUT.write_text("\n".join(out), encoding="utf-8")
+    OUT.write_text("\n".join(out), encoding="utf-8", newline="\n")
     print(f"wrote {OUT} ({len(ids)} entries)")
     return 0
 

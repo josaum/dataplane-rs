@@ -9,10 +9,9 @@
 //! and compiled at build time; the generated messages and the tonic
 //! `RdfStreamService` client/server stubs are exposed as [`proto`].
 //!
-//! Codec output is **unsigned by construction** (Atlas product
-//! invariant 7): frames and batches carry RDF data, lookup state, and
-//! nothing else — encoding or decoding never certifies a source, approves
-//! a rule, or promotes a fact.
+//! Codec output is **unsigned by construction**: frames and batches carry
+//! RDF data, lookup state, and nothing else — encoding or decoding never
+//! certifies a source, approves a rule, or promotes a fact.
 //!
 //! RDF 1.2 triple terms (RDF-star) are carried end to end in the **object**
 //! position, matching the vendored schema's `o_triple_term` field and the
@@ -105,18 +104,18 @@ pub mod proto {
             "/eu.ostrzyciel.jelly.core.proto.v1.patch.rs"
         ));
 
-        /// Generated Atlas-authored patch pub/sub service surface.
+        /// Generated dataplane patch pub/sub service surface.
         ///
-        /// Compiled from `proto/atlas_patch_grpc.proto`, which is written
+        /// Compiled from `proto/dataplane_patch_grpc.proto`, which is written
         /// in this repository (NOT vendored from Jelly upstream): the
         /// vendored `patch.proto` defines no gRPC service and its options
         /// carry no topic name, so the dataplane declares its own
         /// `PatchStreamService` modeled on the vendored
         /// `RdfStreamService` shape.
-        pub mod atlas {
+        pub mod grpc {
             include!(concat!(
                 env!("OUT_DIR"),
-                "/atlas/atlas.dataplane.jelly.patch.v1.rs"
+                "/dataplane/dataplane.jelly.patch.v1.rs"
             ));
         }
     }

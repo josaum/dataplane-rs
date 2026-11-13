@@ -7,12 +7,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tonic::{
-    metadata::{Ascii, MetadataMap, MetadataValue},
     Request, Status,
+    metadata::{Ascii, MetadataMap, MetadataValue},
 };
 
 /// Clock skew, in seconds, tolerated when checking `exp`.
@@ -101,8 +101,17 @@ pub enum AuthError {
     /// The configured public-key file could not be read.
     ///
     /// Carries the configured path and the I/O error kind, never file contents.
-    #[error("cannot read ATLAS_JWT_PUBLIC_KEY_PATH {}: {kind}", path.display())]
+    #[error("cannot read FLIGHT_JWT_PUBLIC_KEY_PATH {}: {kind}", path.display())]
     KeyFileUnreadable { path: PathBuf, kind: io::ErrorKind },
+    /// A server-side variable is set under a name this crate no longer reads.
+    ///
+    /// Ignoring it could start a server with authentication off that its
+    /// operator configured to require it, so loading refuses instead.
+    #[error("{old} was renamed to {new}; set {new} and remove {old}")]
+    RenamedEnv {
+        old: &'static str,
+        new: &'static str,
+    },
 }
 
 /// Validated outbound Flight authorization metadata with redacted debug output.
@@ -185,7 +194,7 @@ impl FlightAuthorizationMetadata {
     where
         F: FnMut(&str) -> Result<Option<String>, AuthError>,
     {
-        let explicit_header = read("ATLAS_FLIGHT_AUTHORIZATION")?;
+        let explicit_header = read("FLIGHT_AUTHORIZATION")?;
         if explicit_header
             .as_deref()
             .map(str::trim)
@@ -193,7 +202,7 @@ impl FlightAuthorizationMetadata {
         {
             return Self::from_values(explicit_header.as_deref(), None);
         }
-        let raw_bearer_token = read("ATLAS_FLIGHT_BEARER_TOKEN")?;
+        let raw_bearer_token = read("FLIGHT_BEARER_TOKEN")?;
         Self::from_values(explicit_header.as_deref(), raw_bearer_token.as_deref())
     }
 }
@@ -235,8 +244,8 @@ pub fn mint_local_workload_authorization(
         tenant_id: tenant_id.to_owned(),
         roles: vec!["service".to_owned()],
         permissions: vec!["flight:invoke".to_owned()],
-        iss: "atlas".to_owned(),
-        aud: "atlas".to_owned(),
+        iss: "dataplane".to_owned(),
+        aud: "dataplane".to_owned(),
         iat: now,
         exp: expires_at,
         jti: uuid::Uuid::new_v4().to_string(),
@@ -265,6 +274,36 @@ fn os_string_into_client_auth(value: OsString) -> Result<String, AuthError> {
         .map_err(|_| AuthError::InvalidClientAuthorization)
 }
 
+/// Server-side variables under their previous names, with their current ones.
+const RENAMED_SERVER_ENV: [(&str, &str); 6] = [
+    ("ATLAS_FLIGHT_REQUIRE_AUTH", "FLIGHT_REQUIRE_AUTH"),
+    (
+        "ATLAS_FLIGHT_ALLOW_LEGACY_HS256",
+        "FLIGHT_ALLOW_LEGACY_HS256",
+    ),
+    ("ATLAS_JWT_PUBLIC_KEY_PEM", "FLIGHT_JWT_PUBLIC_KEY_PEM"),
+    ("ATLAS_JWT_PUBLIC_KEY_PATH", "FLIGHT_JWT_PUBLIC_KEY_PATH"),
+    ("ATLAS_FLIGHT_ISSUER", "FLIGHT_JWT_ISSUER"),
+    ("ATLAS_FLIGHT_AUDIENCE", "FLIGHT_JWT_AUDIENCE"),
+];
+
+/// Refuses a server-side variable that is still set under its previous name.
+///
+/// A deployment that set `ATLAS_FLIGHT_REQUIRE_AUTH=1` and upgraded would
+/// otherwise start with authentication off. An empty value counts as unset,
+/// as everywhere else.
+fn refuse_renamed_server_env<E>(env: &mut E) -> Result<(), AuthError>
+where
+    E: FnMut(&str) -> Option<OsString>,
+{
+    for (old, new) in RENAMED_SERVER_ENV {
+        if server_env(env, old)?.is_some() {
+            return Err(AuthError::RenamedEnv { old, new });
+        }
+    }
+    Ok(())
+}
+
 /// Reads one server-side variable in its canonical form.
 ///
 /// The single place where "set but empty" becomes "unset": the value is
@@ -288,7 +327,7 @@ where
 /// Reads one boolean switch, refusing anything outside the documented set.
 ///
 /// Unset is `false`. An unrecognised value is an error rather than `false`
-/// because for `ATLAS_FLIGHT_REQUIRE_AUTH` reading a typo as `false` turns
+/// because for `FLIGHT_REQUIRE_AUTH` reading a typo as `false` turns
 /// authentication off.
 fn server_flag<E>(env: &mut E, name: &'static str) -> Result<bool, AuthError>
 where
@@ -372,15 +411,15 @@ impl FlightRequestAuthVerifier {
     /// Every variable is trimmed, and a variable that is set but empty counts
     /// as unset, so a sourced `.env.example` behaves like an empty environment.
     ///
-    /// - `ATLAS_FLIGHT_REQUIRE_AUTH` and `ATLAS_FLIGHT_ALLOW_LEGACY_HS256`
+    /// - `FLIGHT_REQUIRE_AUTH` and `FLIGHT_ALLOW_LEGACY_HS256`
     ///   accept `1`, `true`, `yes`, `on` and `0`, `false`, `no`, `off`, in any
     ///   ASCII case. Unset means `false`.
-    /// - `ATLAS_FLIGHT_ISSUER` and `ATLAS_FLIGHT_AUDIENCE` scope accepted tokens.
-    /// - `ATLAS_JWT_PUBLIC_KEY_PEM` supplies the ES256 key inline. Only when it
-    ///   is unset is the file named by `ATLAS_JWT_PUBLIC_KEY_PATH` read.
+    /// - `FLIGHT_JWT_ISSUER` and `FLIGHT_JWT_AUDIENCE` scope accepted tokens.
+    /// - `FLIGHT_JWT_PUBLIC_KEY_PEM` supplies the ES256 key inline. Only when it
+    ///   is unset is the file named by `FLIGHT_JWT_PUBLIC_KEY_PATH` read.
     /// - `JWT_SECRET` is the legacy HS256 secret.
     ///
-    /// With `ATLAS_FLIGHT_REQUIRE_AUTH` unset the returned verifier is
+    /// With `FLIGHT_REQUIRE_AUTH` unset the returned verifier is
     /// disabled and accepts every request. A network-facing surface must call
     /// [`Self::from_env_required`] instead, which refuses that state.
     ///
@@ -407,11 +446,12 @@ impl FlightRequestAuthVerifier {
         E: FnMut(&str) -> Option<OsString>,
         R: FnOnce(&Path) -> io::Result<String>,
     {
-        let require_auth = server_flag(&mut env, "ATLAS_FLIGHT_REQUIRE_AUTH")?;
-        let allow_legacy_hs256 = server_flag(&mut env, "ATLAS_FLIGHT_ALLOW_LEGACY_HS256")?;
-        let es256_public_key_pem = match server_env(&mut env, "ATLAS_JWT_PUBLIC_KEY_PEM")? {
+        refuse_renamed_server_env(&mut env)?;
+        let require_auth = server_flag(&mut env, "FLIGHT_REQUIRE_AUTH")?;
+        let allow_legacy_hs256 = server_flag(&mut env, "FLIGHT_ALLOW_LEGACY_HS256")?;
+        let es256_public_key_pem = match server_env(&mut env, "FLIGHT_JWT_PUBLIC_KEY_PEM")? {
             Some(pem) => Some(pem),
-            None => match server_env(&mut env, "ATLAS_JWT_PUBLIC_KEY_PATH")? {
+            None => match server_env(&mut env, "FLIGHT_JWT_PUBLIC_KEY_PATH")? {
                 Some(path) => {
                     let path = PathBuf::from(path);
                     // A key the operator asked for but that cannot be loaded
@@ -429,8 +469,8 @@ impl FlightRequestAuthVerifier {
         };
         let config = AuthConfig {
             require_auth,
-            issuer: server_env(&mut env, "ATLAS_FLIGHT_ISSUER")?,
-            audience: server_env(&mut env, "ATLAS_FLIGHT_AUDIENCE")?,
+            issuer: server_env(&mut env, "FLIGHT_JWT_ISSUER")?,
+            audience: server_env(&mut env, "FLIGHT_JWT_AUDIENCE")?,
             es256_public_key_pem,
             legacy_hs256_secret: server_env(&mut env, "JWT_SECRET")?,
             allow_legacy_hs256,
@@ -633,8 +673,8 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
             tenant_id: "system",
             roles: vec!["service"],
             permissions: vec!["flight:invoke"],
-            iss: "atlas",
-            aud: "atlas",
+            iss: "dataplane",
+            aud: "dataplane",
             iat: now,
             exp: now + 60,
             jti: "python-service-jti",
@@ -645,8 +685,8 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
     fn verifier() -> FlightRequestAuthVerifier {
         FlightRequestAuthVerifier::new(AuthConfig {
             require_auth: true,
-            issuer: Some("atlas".to_owned()),
-            audience: Some("atlas".to_owned()),
+            issuer: Some("dataplane".to_owned()),
+            audience: Some("dataplane".to_owned()),
             es256_public_key_pem: None,
             legacy_hs256_secret: Some("test-only-secret".to_owned()),
             allow_legacy_hs256: true,
@@ -689,8 +729,8 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
         let secret = "debug-must-not-leak-this-hs256-secret";
         let config = AuthConfig {
             require_auth: true,
-            issuer: Some("atlas".to_owned()),
-            audience: Some("atlas".to_owned()),
+            issuer: Some("dataplane".to_owned()),
+            audience: Some("dataplane".to_owned()),
             es256_public_key_pem: None,
             legacy_hs256_secret: Some(secret.to_owned()),
             allow_legacy_hs256: true,
@@ -723,7 +763,7 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
             legacy_hs256_secret: Some("test-only-secret".to_owned()),
             allow_legacy_hs256: true,
             issuer: None,
-            audience: Some("atlas".to_owned()),
+            audience: Some("dataplane".to_owned()),
         })
         .unwrap()
         .require_enabled()
@@ -765,8 +805,8 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
             tenant_id: "internal".into(),
             roles: vec![],
             permissions: vec!["flight:invoke".into()],
-            iss: "atlas".into(),
-            aud: "atlas".into(),
+            iss: "dataplane".into(),
+            aud: "dataplane".into(),
             iat: now,
             exp: now + 60,
             jti: "test-jti".into(),
@@ -873,8 +913,8 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
         metadata.insert("authorization", format!("Bearer {token}").parse().unwrap());
         let verifier = FlightRequestAuthVerifier::new(AuthConfig {
             require_auth: true,
-            issuer: Some("atlas".to_owned()),
-            audience: Some("atlas".to_owned()),
+            issuer: Some("dataplane".to_owned()),
+            audience: Some("dataplane".to_owned()),
             es256_public_key_pem: Some(TEST_ES256_PUBLIC_KEY.to_owned()),
             legacy_hs256_secret: None,
             allow_legacy_hs256: false,
@@ -917,11 +957,13 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
                 .unwrap(),
             "Bearer explicit-token"
         );
-        assert!(explicit_request
-            .metadata()
-            .get("authorization")
-            .unwrap()
-            .is_sensitive());
+        assert!(
+            explicit_request
+                .metadata()
+                .get("authorization")
+                .unwrap()
+                .is_sensitive()
+        );
         assert!(!format!("{explicit_request:?}").contains("explicit-token"));
 
         let fallback =
@@ -944,15 +986,15 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
         let authorization = FlightAuthorizationMetadata::from_env_source(|name| {
             reads.push(name.to_owned());
             match name {
-                "ATLAS_FLIGHT_AUTHORIZATION" => Ok(Some("Bearer explicit-token".to_owned())),
-                "ATLAS_FLIGHT_BEARER_TOKEN" => Err(AuthError::InvalidClientAuthorization),
+                "FLIGHT_AUTHORIZATION" => Ok(Some("Bearer explicit-token".to_owned())),
+                "FLIGHT_BEARER_TOKEN" => Err(AuthError::InvalidClientAuthorization),
                 _ => unreachable!(),
             }
         })
         .unwrap()
         .unwrap();
 
-        assert_eq!(reads, ["ATLAS_FLIGHT_AUTHORIZATION"]);
+        assert_eq!(reads, ["FLIGHT_AUTHORIZATION"]);
         assert_eq!(
             authorization
                 .request(())
@@ -965,9 +1007,11 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
 
     #[test]
     fn outbound_authorization_required_variant_fails_closed_when_missing() {
-        assert!(FlightAuthorizationMetadata::from_values(None, None)
-            .unwrap()
-            .is_none());
+        assert!(
+            FlightAuthorizationMetadata::from_values(None, None)
+                .unwrap()
+                .is_none()
+        );
         let error = FlightAuthorizationMetadata::from_values_required(None, None).unwrap_err();
         assert!(matches!(error, AuthError::MissingClientAuthorization));
     }
@@ -1059,8 +1103,8 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
     fn dual_material_verifier(allow_legacy_hs256: bool) -> FlightRequestAuthVerifier {
         FlightRequestAuthVerifier::new(AuthConfig {
             require_auth: true,
-            issuer: Some("atlas".to_owned()),
-            audience: Some("atlas".to_owned()),
+            issuer: Some("dataplane".to_owned()),
+            audience: Some("dataplane".to_owned()),
             es256_public_key_pem: Some(TEST_ES256_PUBLIC_KEY.to_owned()),
             legacy_hs256_secret: Some(WORKLOAD_SECRET.to_owned()),
             allow_legacy_hs256,
@@ -1215,8 +1259,8 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
 
         let verifier = FlightRequestAuthVerifier::new(AuthConfig {
             require_auth: true,
-            issuer: Some("atlas".to_owned()),
-            audience: Some("atlas".to_owned()),
+            issuer: Some("dataplane".to_owned()),
+            audience: Some("dataplane".to_owned()),
             es256_public_key_pem: None,
             legacy_hs256_secret: Some(raw_secret),
             allow_legacy_hs256: true,
@@ -1259,8 +1303,8 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
     fn require_auth_flag_accepts_only_the_documented_values() {
         for value in ["1", "true", "TRUE", "True", "yes", "YES", "on", " true\n"] {
             let pairs = [
-                ("ATLAS_FLIGHT_REQUIRE_AUTH", value),
-                ("ATLAS_JWT_PUBLIC_KEY_PEM", TEST_ES256_PUBLIC_KEY),
+                ("FLIGHT_REQUIRE_AUTH", value),
+                ("FLIGHT_JWT_PUBLIC_KEY_PEM", TEST_ES256_PUBLIC_KEY),
             ];
             let verifier = FlightRequestAuthVerifier::from_env_source(
                 env_source(&pairs),
@@ -1271,7 +1315,7 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
         }
 
         for value in ["0", "false", "FALSE", "False", "no", "off", "", "  "] {
-            let pairs = [("ATLAS_FLIGHT_REQUIRE_AUTH", value)];
+            let pairs = [("FLIGHT_REQUIRE_AUTH", value)];
             let verifier = FlightRequestAuthVerifier::from_env_source(
                 env_source(&pairs),
                 key_file_must_not_be_read,
@@ -1289,14 +1333,11 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
     #[test]
     fn unrecognised_flag_value_refuses_to_start_without_echoing_the_value() {
         const TYPO: &str = "distinctive-typo-value";
-        for name in [
-            "ATLAS_FLIGHT_REQUIRE_AUTH",
-            "ATLAS_FLIGHT_ALLOW_LEGACY_HS256",
-        ] {
+        for name in ["FLIGHT_REQUIRE_AUTH", "FLIGHT_ALLOW_LEGACY_HS256"] {
             for value in ["enabled", "tru", "2", "y", "true;", "t r u e", TYPO] {
                 let pairs = [
                     (name, value),
-                    ("ATLAS_JWT_PUBLIC_KEY_PEM", TEST_ES256_PUBLIC_KEY),
+                    ("FLIGHT_JWT_PUBLIC_KEY_PEM", TEST_ES256_PUBLIC_KEY),
                     ("JWT_SECRET", WORKLOAD_SECRET),
                 ];
                 let error = FlightRequestAuthVerifier::from_env_source(
@@ -1319,36 +1360,75 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
     }
 
     #[cfg(unix)]
+    fn non_unicode_os_string() -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(vec![b't', 0xff])
+    }
+
+    #[cfg(windows)]
+    fn non_unicode_os_string() -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+        OsString::from_wide(&[u16::from(b't'), 0xD800])
+    }
+
+    #[test]
+    fn a_server_variable_under_its_previous_name_refuses_to_start() {
+        for (old, new) in RENAMED_SERVER_ENV {
+            let error = FlightRequestAuthVerifier::from_env_source(
+                env_source(&[(old, "1"), ("FLIGHT_REQUIRE_AUTH", "1")]),
+                key_file_must_not_be_read,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, AuthError::RenamedEnv { old: o, new: n } if o == old && n == new),
+                "{old}: {error}"
+            );
+        }
+        // The case the refusal exists for: the old switch alone must not
+        // start a server with authentication off.
+        let error = FlightRequestAuthVerifier::from_env_source(
+            env_source(&[("ATLAS_FLIGHT_REQUIRE_AUTH", "1")]),
+            key_file_must_not_be_read,
+        )
+        .unwrap_err();
+        assert!(matches!(error, AuthError::RenamedEnv { .. }));
+        // An empty template line is unset, as for every other variable.
+        assert!(
+            FlightRequestAuthVerifier::from_env_source(
+                env_source(&[("ATLAS_FLIGHT_REQUIRE_AUTH", "")]),
+                key_file_must_not_be_read,
+            )
+            .is_ok()
+        );
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn non_unicode_server_variable_refuses_to_start() {
-        use std::os::unix::ffi::OsStringExt;
-
         let error = FlightRequestAuthVerifier::from_env_source(
-            |name| {
-                (name == "ATLAS_FLIGHT_REQUIRE_AUTH").then(|| OsString::from_vec(vec![b't', 0xff]))
-            },
+            |name| (name == "FLIGHT_REQUIRE_AUTH").then(non_unicode_os_string),
             key_file_must_not_be_read,
         )
         .unwrap_err();
         assert!(matches!(
             error,
             AuthError::NonUnicodeEnv {
-                name: "ATLAS_FLIGHT_REQUIRE_AUTH"
+                name: "FLIGHT_REQUIRE_AUTH"
             }
         ));
 
-        let client = os_string_into_client_auth(OsString::from_vec(vec![0xff])).unwrap_err();
+        let client = os_string_into_client_auth(non_unicode_os_string()).unwrap_err();
         assert!(matches!(client, AuthError::InvalidClientAuthorization));
     }
 
     /// The Flight block of the repository `.env.example`, verbatim.
     const ENV_EXAMPLE_SHAPE: [(&str, &str); 7] = [
-        ("ATLAS_FLIGHT_REQUIRE_AUTH", "true"),
-        ("ATLAS_FLIGHT_ISSUER", "atlas"),
-        ("ATLAS_FLIGHT_AUDIENCE", "atlas"),
-        ("ATLAS_JWT_PUBLIC_KEY_PEM", ""),
-        ("ATLAS_JWT_PUBLIC_KEY_PATH", ""),
-        ("ATLAS_FLIGHT_ALLOW_LEGACY_HS256", "false"),
+        ("FLIGHT_REQUIRE_AUTH", "true"),
+        ("FLIGHT_JWT_ISSUER", "dataplane"),
+        ("FLIGHT_JWT_AUDIENCE", "dataplane"),
+        ("FLIGHT_JWT_PUBLIC_KEY_PEM", ""),
+        ("FLIGHT_JWT_PUBLIC_KEY_PATH", ""),
+        ("FLIGHT_ALLOW_LEGACY_HS256", "false"),
         ("JWT_SECRET", ""),
     ];
 
@@ -1365,7 +1445,7 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
     #[test]
     fn env_example_with_only_the_key_path_filled_in_starts_with_es256() {
         let mut pairs = ENV_EXAMPLE_SHAPE;
-        pairs[4] = ("ATLAS_JWT_PUBLIC_KEY_PATH", " /run/secrets/flight.pem ");
+        pairs[4] = ("FLIGHT_JWT_PUBLIC_KEY_PATH", " /run/secrets/flight.pem ");
         let mut read_paths = Vec::new();
         let verifier = FlightRequestAuthVerifier::from_env_source(env_source(&pairs), |path| {
             read_paths.push(path.to_path_buf());
@@ -1385,9 +1465,9 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
     #[test]
     fn inline_pem_wins_and_the_key_path_is_never_consulted() {
         let pairs = [
-            ("ATLAS_FLIGHT_REQUIRE_AUTH", "true"),
-            ("ATLAS_JWT_PUBLIC_KEY_PEM", TEST_ES256_PUBLIC_KEY),
-            ("ATLAS_JWT_PUBLIC_KEY_PATH", "/nonexistent/flight.pem"),
+            ("FLIGHT_REQUIRE_AUTH", "true"),
+            ("FLIGHT_JWT_PUBLIC_KEY_PEM", TEST_ES256_PUBLIC_KEY),
+            ("FLIGHT_JWT_PUBLIC_KEY_PATH", "/nonexistent/flight.pem"),
         ];
         let mut lookups = Vec::new();
         let mut source = env_source(&pairs);
@@ -1399,26 +1479,30 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
             key_file_must_not_be_read,
         )
         .unwrap();
-        assert!(lookups
-            .iter()
-            .any(|name| name == "ATLAS_JWT_PUBLIC_KEY_PEM"));
-        assert!(!lookups
-            .iter()
-            .any(|name| name == "ATLAS_JWT_PUBLIC_KEY_PATH"));
+        assert!(
+            lookups
+                .iter()
+                .any(|name| name == "FLIGHT_JWT_PUBLIC_KEY_PEM")
+        );
+        assert!(
+            !lookups
+                .iter()
+                .any(|name| name == "FLIGHT_JWT_PUBLIC_KEY_PATH")
+        );
     }
 
     #[test]
     fn unreadable_key_path_is_a_typed_error_naming_the_path() {
         let es256_only = [
-            ("ATLAS_FLIGHT_REQUIRE_AUTH", "true"),
-            ("ATLAS_JWT_PUBLIC_KEY_PATH", "/nonexistent/flight.pem"),
+            ("FLIGHT_REQUIRE_AUTH", "true"),
+            ("FLIGHT_JWT_PUBLIC_KEY_PATH", "/nonexistent/flight.pem"),
         ];
         // A migration deployment must not quietly start HS256-only when the
         // ES256 key the operator asked for could not be loaded.
         let with_legacy_fallback = [
-            ("ATLAS_FLIGHT_REQUIRE_AUTH", "true"),
-            ("ATLAS_JWT_PUBLIC_KEY_PATH", "/nonexistent/flight.pem"),
-            ("ATLAS_FLIGHT_ALLOW_LEGACY_HS256", "true"),
+            ("FLIGHT_REQUIRE_AUTH", "true"),
+            ("FLIGHT_JWT_PUBLIC_KEY_PATH", "/nonexistent/flight.pem"),
+            ("FLIGHT_ALLOW_LEGACY_HS256", "true"),
             ("JWT_SECRET", WORKLOAD_SECRET),
         ];
         for pairs in [&es256_only[..], &with_legacy_fallback[..]] {
@@ -1435,7 +1519,7 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
             }
             let message = error.to_string();
             assert!(message.contains("/nonexistent/flight.pem"), "{message}");
-            assert!(message.contains("ATLAS_JWT_PUBLIC_KEY_PATH"), "{message}");
+            assert!(message.contains("FLIGHT_JWT_PUBLIC_KEY_PATH"), "{message}");
             assert!(!message.contains(WORKLOAD_SECRET));
         }
     }
@@ -1449,8 +1533,8 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
         ));
         let missing_text = missing.to_str().unwrap().to_owned();
         let pairs = [
-            ("ATLAS_FLIGHT_REQUIRE_AUTH", "true"),
-            ("ATLAS_JWT_PUBLIC_KEY_PATH", missing_text.as_str()),
+            ("FLIGHT_REQUIRE_AUTH", "true"),
+            ("FLIGHT_JWT_PUBLIC_KEY_PATH", missing_text.as_str()),
         ];
         let error = FlightRequestAuthVerifier::from_env_source(env_source(&pairs), |path| {
             std::fs::read_to_string(path)

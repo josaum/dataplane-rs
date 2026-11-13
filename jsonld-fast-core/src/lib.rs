@@ -6,7 +6,7 @@
 //! yields the same expanded document and the same quad rows, including
 //! blank node labels.
 //!
-//! Output is **unsigned by construction** (Atlas product invariant 7):
+//! Output is **unsigned by construction**:
 //! decoding preserves term identity, named-graph identity, and source
 //! provenance, but never certifies a source or promotes a fact. This crate
 //! is also a **sovereign boundary**: it performs no network I/O. A context

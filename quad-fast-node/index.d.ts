@@ -2,12 +2,12 @@
  * quad-fast-node: Node bindings for the UnsignedQuadStream v1 Arrow contract
  * and the Jelly RDF frame codec.
  *
- * All output is unsigned by construction (Atlas product invariant 7); the
- * Arrow schema carries `atlas.assurance = "unsigned"` and nothing in this
- * binding attaches or upgrades assurance. Every function is fail-closed:
- * malformed input and unknown option keys throw typed errors whose message
- * starts with a stable machine-readable code (`input:`, `resource_limit:`,
- * `precision:`, `frame_decode:`, `unsupported:`, ...).
+ * All output is unsigned by construction; the Arrow schema carries
+ * `dataplane.assurance = "unsigned"` and nothing in this binding attaches or
+ * upgrades assurance. Every function is fail-closed: malformed input and
+ * unknown option keys throw typed errors whose message starts with a stable
+ * machine-readable code (`input:`, `resource_limit:`, `precision:`,
+ * `frame_decode:`, `unsupported:`, ...).
  */
 
 /** An IRI or blank-node term. */
@@ -108,7 +108,7 @@ export declare function version(): string;
 
 /**
  * Builds one UnsignedQuadStream batch from quad objects and returns it as
- * Arrow IPC stream bytes (schema metadata: `atlas.assurance = "unsigned"`).
+ * Arrow IPC stream bytes (schema metadata: `dataplane.assurance = "unsigned"`).
  */
 export declare function quadsToIpc(quads: QuadObject[], options?: IpcOptions): Buffer;
 

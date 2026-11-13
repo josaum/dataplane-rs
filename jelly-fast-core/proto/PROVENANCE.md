@@ -13,10 +13,10 @@ Files:
 License: upstream Jelly protobuf is Apache-2.0. Do not edit these files by
 hand; re-vendor from a pinned upstream commit and update this record.
 
-## Atlas-authored files (NOT vendored)
+## Dataplane-authored files (NOT vendored)
 
-- `atlas_patch_grpc.proto` — the dataplane's own patch pub/sub service
-  surface (`atlas.dataplane.jelly.patch.v1`), written in this repository.
+- `dataplane_patch_grpc.proto` — the dataplane's own patch pub/sub service
+  surface (`dataplane.jelly.patch.v1`), written in this repository.
   The vendored `patch.proto` defines no gRPC service and its options carry
   no topic name, so this file declares one, modeled on the vendored
   `grpc.proto` `RdfStreamService` shape. It claims no wire

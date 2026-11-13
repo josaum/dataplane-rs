@@ -4,7 +4,7 @@
 This file is NOT part of the cargo gate (cargo ignores .py files in
 ``tests/``). Run it against a built extension module:
 
-    cd cartridges/semantic-dataplane/dataplane-rs/quad-fast-py
+    cd quad-fast-py
     uv sync && uv run maturin develop   # or: pip install maturin && maturin develop
     uv run pytest tests/                # or: pytest tests/
 
@@ -123,21 +123,21 @@ def test_malformed_input_raises_value_error() -> None:
 def test_jsonld_to_quad_ipc_decodes_with_provenance() -> None:
     document = (
         '{"@context": {"id": "@id",'
-        ' "named_graph": {"@id": "urn:atlas:namedGraph", "@type": "@id"}},'
+        ' "named_graph": {"@id": "urn:dataplane:namedGraph", "@type": "@id"}},'
         ' "id": "urn:uuid:00000000-0000-4000-8000-000000000000",'
-        ' "named_graph": "urn:atlas:graph:events:v1"}'
+        ' "named_graph": "urn:dataplane:graph:events:v1"}'
     )
     payload = quad_fast.jsonld_to_quad_ipc(
-        document, provenance={"source_artifact_iri": "urn:atlas:test:artifact"}
+        document, provenance={"source_artifact_iri": "urn:dataplane:test:artifact"}
     )
     quads = quad_fast.read_quad_ipc(payload)
     subject, predicate, obj, graph, provenance = quads[0]
     assert subject == ("iri", "urn:uuid:00000000-0000-4000-8000-000000000000")
-    assert predicate == "urn:atlas:namedGraph"
-    assert obj == ("iri", "urn:atlas:graph:events:v1", None, None)
+    assert predicate == "urn:dataplane:namedGraph"
+    assert obj == ("iri", "urn:dataplane:graph:events:v1", None, None)
     assert graph is None
     assert provenance is not None
-    assert provenance["source_artifact_iri"] == "urn:atlas:test:artifact"
+    assert provenance["source_artifact_iri"] == "urn:dataplane:test:artifact"
 
 
 def test_jsonld_to_quad_ipc_refuses_remote_context() -> None:

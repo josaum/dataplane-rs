@@ -139,7 +139,7 @@ impl Default for TopicRegistry {
 /// Registry of Jelly-Patch pub/sub topics keyed by topic name.
 ///
 /// Same relay semantics as [`TopicRegistry`]; the topic name comes from
-/// the publish envelope of the Atlas-authored patch service (the vendored
+/// the publish envelope of the dataplane patch service (the vendored
 /// `RdfPatchOptions` carries no stream name).
 #[derive(Debug)]
 pub struct PatchTopicRegistry {

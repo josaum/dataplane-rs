@@ -96,11 +96,11 @@
 //! [`registry::REGISTRY_ENTRIES`] by a vendor-time script whose output is
 //! checked against that YAML by `tests/registry_tables.rs`.
 //!
-//! # Atlas product invariants
+//! # Dataplane invariants
 //!
 //! Codec output is **unsigned by construction**: compression preserves the
 //! document byte-for-byte semantics but never certifies, approves, or
-//! promotes its content (Atlas product invariant 7). The codec performs
+//! promotes its content. The codec performs
 //! **no network I/O**: spec constants are vendored at authoring time (see
 //! [`registry`]) and remote or unresolvable contexts are explicit errors;
 //! registered context content comes only from the caller.
@@ -119,7 +119,7 @@
 //! # fn main() -> Result<(), cborld_fast_core::CborldError> {
 //! let doc = json!({
 //!     "@context": {"name": "http://schema.org/name"},
-//!     "name": "Atlas"
+//!     "name": "Example"
 //! });
 //! let options = CborldOptions::default();
 //! let bytes = compress(&doc, &options)?;
@@ -153,7 +153,7 @@
 //!     ..CborldOptions::default()
 //! };
 //!
-//! let doc = json!({"@context": iri, "name": "Atlas"});
+//! let doc = json!({"@context": iri, "name": "Example"});
 //! let bytes = compress(&doc, &options)?;
 //! assert_eq!(decompress(&bytes, &options)?, doc);
 //!

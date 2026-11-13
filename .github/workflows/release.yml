@@ -1,0 +1,204 @@
+# Tag `vX.Y.Z` -> one wheel per (crate, platform), each carrying exactly one
+# CycloneDX SBOM, plus `release-manifest.json` binding every wheel to this
+# commit, its SHA-256, toolchain and target. Consumers vendor the whole set.
+#
+# Platforms are the ones the consumers actually deploy on: Apple Silicon for
+# workstations, Linux x86_64 and aarch64 for containers, and Windows x64 for
+# desktop distributions.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  ARM_MANYLINUX_IMAGE: quay.io/pypa/manylinux2014_aarch64@sha256:d36e257b4f7b1130a1442a5cd28022307645a92b8093ab65543205426354cfd2
+  # Every Python binding crate in the workspace.
+  BINDINGS: quad-fast-py
+  # Every Node-API binding crate in the workspace.
+  NODE_BINDINGS: quad-fast-node
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  wheels:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,         target: aarch64-apple-darwin,      compat: "" }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  compat: "--zig --compatibility manylinux_2_17" }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, compat: "--compatibility manylinux_2_17" }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    compat: "" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - if: matrix.target != 'aarch64-unknown-linux-gnu'
+        run: python -m pip install "maturin==1.15.0" "ziglang==0.15.2"
+      - name: Build every binding for ${{ matrix.target }}
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig_python_path="$(command -v python || command -v python3)"
+          zig_bin_path="$("$zig_python_path" -c 'import sys, ziglang; from pathlib import Path; print(Path(ziglang.__file__).with_name("zig.exe" if sys.platform == "win32" else "zig"))')"
+          for crate in $BINDINGS; do
+            (cd "$crate" && env CARGO_ZIGBUILD_PYTHON_PATH="$zig_python_path" CARGO_ZIGBUILD_ZIG_PATH="$zig_bin_path" maturin build --release --locked --target "${{ matrix.target }}" ${{ matrix.compat }} --out ../dist)
+          done
+          ls -1 dist
+      - name: Build native ARM manylinux wheels
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          task_rustc_path="$(rustup which --toolchain 1.98.1 rustc)"
+          task_rust_toolchain="${task_rustc_path%/bin/rustc}"
+          docker run --rm -i --platform linux/arm64 \
+            --env BINDINGS \
+            --env CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=gcc \
+            --env RUSTFLAGS='-C link-arg=-Wl,--fix-cortex-a53-843419' \
+            --volume "${task_rust_toolchain}:/opt/rust:ro" \
+            --volume "$PWD:/io" --workdir /io \
+            "${{ env.ARM_MANYLINUX_IMAGE }}" bash -euo pipefail <<'ARM_NATIVE_BUILD'
+          export PATH="/opt/rust/bin:/opt/python/cp312-cp312/bin:$PATH"
+          test "$(uname -m)" = aarch64
+          test "$(rustc --version | cut -d ' ' -f 2)" = 1.98.1
+          gcc --version
+          cargo --version
+          python -m pip install "maturin==1.15.0"
+          for crate in $BINDINGS; do
+            maturin build --release --locked --target aarch64-unknown-linux-gnu \
+              --compatibility manylinux_2_17 --manifest-path "$crate/Cargo.toml" \
+              --interpreter /opt/python/cp312-cp312/bin/python --out dist
+          done
+          ARM_NATIVE_BUILD
+      - name: Smoke native ARM wheel artifacts
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          read -r -a task_bindings <<< "$BINDINGS"
+          python3 -c "import sys; from pathlib import Path; sys.path.insert(0, 'scripts'); from release_manifest import artifact_target; wheels = list(Path('dist').glob('*.whl')); assert len(wheels) == len(sys.argv) - 1; assert all(artifact_target(wheel) == 'aarch64-unknown-linux-gnu' for wheel in wheels)" "${task_bindings[@]}"
+          python3 -m pip install "pytest==9.1.1" "pyarrow==25.0.1"
+          python3 -m pip install --no-index --no-deps dist/*.whl
+          python3 -I -c "import importlib, os; [importlib.import_module(crate.removesuffix('-py').replace('-', '_')) for crate in os.environ['BINDINGS'].split()]"
+          python3 -I -m pytest --import-mode=importlib -q quad-fast-py/tests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  node:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,         target: aarch64-apple-darwin,      platform: darwin-arm64 }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  platform: linux-x64-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, platform: linux-arm64-gnu }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    platform: win32-x64-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build every Node binding for ${{ matrix.target }}
+        shell: bash
+        run: |
+          read -r -a node_bindings <<< "$NODE_BINDINGS"
+          scripts/build-node.sh "${node_bindings[@]}"
+      - name: Load and parse a generated fixture through each binding
+        run: node scripts/smoke-node.mjs
+      - name: Pack one tarball per binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-node
+          for crate in $NODE_BINDINGS; do
+            version="$(node -p "require('./$crate/package.json').version")"
+            (cd "$crate" && pnpm pack --pack-destination ../dist-node)
+            mv "dist-node/$crate-$version.tgz" "dist-node/$crate-$version-${{ matrix.platform }}.tgz"
+          done
+          ls -1 dist-node
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.target }}
+          path: dist-node/*.tgz
+          if-no-files-found: error
+
+  manifest:
+    needs: [wheels, node]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: node-*
+          path: dist
+          merge-multiple: true
+      - name: Embed exactly one CycloneDX SBOM per wheel
+        run: |
+          set -euo pipefail
+          cargo install cargo-cyclonedx --locked
+          for core in *-core; do
+            cargo cyclonedx --manifest-path "$core/Cargo.toml" -f json --describe crate
+          done
+          python3 scripts/inject_sbom.py --dist dist
+      - name: Stamp the release manifest
+        run: |
+          set -euo pipefail
+          python3 scripts/release_manifest.py --out dist --require-complete
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.whl
+            dist/*.tgz
+            dist/release-manifest.json
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: |
+            dist/*.whl
+            dist/*.tgz
+            dist/release-manifest.json
+            dist/SHA256SUMS

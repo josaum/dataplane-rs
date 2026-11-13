@@ -8,13 +8,17 @@ version = "0.1.0"
 description = "UnsignedQuadStream v1 quad batches and Jelly frames from Python"
 requires-python = ">=3.9"
 authors = [{ name = "Dionisio Chiuratto Agourakis" }]
+dependencies = [
+    "pyarrow>=18.0.0",
+]
 
 [project.urls]
-Homepage = "https://github.com/josaum/dataplane-rs"
-Repository = "https://github.com/josaum/dataplane-rs/tree/main/quad-fast-py"
+Homepage = "https://github.com/fast-parser-inc/dataplane-rs"
+Repository = "https://github.com/fast-parser-inc/dataplane-rs/tree/main/quad-fast-py"
 
 [dependency-groups]
 dev = [
+    "pyarrow>=18.0.0",
     "pytest>=8",
 ]
 

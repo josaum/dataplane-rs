@@ -516,10 +516,10 @@ fn schema_and_metadata_mutations_are_refused_as_contract_errors() {
     ));
     // Metadata is the assurance boundary: every tamper must be refused.
     for key in [
-        "atlas.contract",
-        "atlas.contract_version",
-        "atlas.assurance",
-        "atlas.arrow_version",
+        "dataplane.contract",
+        "dataplane.contract_version",
+        "dataplane.assurance",
+        "dataplane.arrow_version",
     ] {
         for replacement in [None, Some("2"), Some("signed"), Some("")] {
             let mut metadata = contract.metadata().clone();
@@ -547,14 +547,14 @@ fn schema_and_metadata_mutations_are_refused_as_contract_errors() {
     }
     {
         let mut metadata = contract.metadata().clone();
-        metadata.insert("atlas.extra".into(), "no".into());
+        metadata.insert("dataplane.extra".into(), "no".into());
         let fields: Vec<Field> = contract
             .fields()
             .iter()
             .map(|field| field.as_ref().clone())
             .collect();
         mutants.push((
-            "extra metadata key atlas.extra".into(),
+            "extra metadata key dataplane.extra".into(),
             Arc::new(Schema::new_with_metadata(fields, metadata)),
         ));
     }

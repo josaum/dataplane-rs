@@ -66,7 +66,7 @@ impl Default for QuadLimits {
 /// Immutable source provenance attached to a quad.
 ///
 /// Provenance is carried, never certified: attaching it does not sign the
-/// quad (Atlas product invariant 7).
+/// quad.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SourceProvenance {
     /// IRI of the source artifact the quad was decoded from.

@@ -9,9 +9,7 @@ license = "MIT"
 publish = false
 
 [features]
-# Wires the shared `flight-auth` JWT verifier (from `office-parsers-rs`) into
-# `serve_with_verifier`. The path-dependency direction mirrors the precedented
-# `office-parsers-rs -> atlas-reasoner` cross-workspace reuse.
+# Wires the shared `flight-auth` JWT verifier into `serve_with_verifier`.
 auth = ["dep:flight-auth"]
 
 [dependencies]

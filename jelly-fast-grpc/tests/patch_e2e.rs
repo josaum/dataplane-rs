@@ -9,7 +9,7 @@ use jelly_fast_core::{
     JellyPatchDecoderOptions, JellyPatchEncoderOptions, PATCH_PROTOCOL_VERSION, PatchOp,
     proto::patch::{
         PatchStatementType, PatchStreamType, RdfPatchFrame, RdfPatchOptions,
-        atlas::{PatchPublish, patch_stream_service_client::PatchStreamServiceClient},
+        grpc::{PatchPublish, patch_stream_service_client::PatchStreamServiceClient},
     },
 };
 use jelly_fast_grpc::{JellyGrpcError, JellyPatchClient, JellyPatchServer, PatchTopicRegistry};

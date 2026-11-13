@@ -3,10 +3,9 @@
 //!
 //! [`RecordBatch::clone`] only bumps Arrow `Arc` buffers. That alias is
 //! transport identity, not a signature, not an assurance upgrade, and not a
-//! new certified observation (Atlas product invariants 1, 2, and 7). This
-//! newtype makes that contract visible at the type level: a reasoner
-//! composite `RecordBatch` cannot enter a store typed as
-//! [`UnsignedQuadBatch`] without passing [`UnsignedQuadBatch::try_from_batch`],
+//! new certified observation. This newtype makes that contract visible at the
+//! type level: a downstream composite `RecordBatch` cannot enter a store typed
+//! as [`UnsignedQuadBatch`] without passing [`UnsignedQuadBatch::try_from_batch`],
 //! which re-runs [`crate::validate_contract`] and column-encoding checks.
 
 use arrow_array::RecordBatch;
@@ -17,7 +16,7 @@ use crate::{error::QuadError, reader::QuadStreamReader};
 /// A `RecordBatch` that has been checked as `UnsignedQuadStream` v1.
 ///
 /// Construct only through [`Self::try_from_batch`]. [`Clone`] shares the
-/// same Arrow buffers; it does not rewrite `atlas.assurance` and must not
+/// same Arrow buffers; it does not rewrite `dataplane.assurance` and must not
 /// be treated as authority.
 #[derive(Clone, Debug)]
 pub struct UnsignedQuadBatch {
@@ -54,7 +53,7 @@ impl UnsignedQuadBatch {
         self.batch.num_rows()
     }
 
-    /// Schema of the inner batch (`atlas.assurance` remains `"unsigned"`).
+    /// Schema of the inner batch (`dataplane.assurance` remains `"unsigned"`).
     #[must_use]
     pub fn schema(&self) -> SchemaRef {
         self.batch.schema()
@@ -98,7 +97,7 @@ mod tests {
             wrapped
                 .schema()
                 .metadata()
-                .get("atlas.assurance")
+                .get("dataplane.assurance")
                 .map(String::as_str),
             Some("unsigned")
         );
@@ -116,7 +115,7 @@ mod tests {
             cloned
                 .schema()
                 .metadata()
-                .get("atlas.assurance")
+                .get("dataplane.assurance")
                 .map(String::as_str),
             Some("unsigned")
         );
@@ -152,13 +151,13 @@ mod tests {
     fn try_from_batch_refuses_arrow_version_drift_and_extra_metadata() {
         let batch = finished_batch();
         let mut drifted = batch.schema().metadata().clone();
-        drifted.insert("atlas.arrow_version".into(), "57.0.0".into());
+        drifted.insert("dataplane.arrow_version".into(), "57.0.0".into());
         let error = UnsignedQuadBatch::try_from_batch(batch_with_metadata(&batch, drifted))
             .expect_err("arrow_version is contract-checked");
         assert_eq!(error.code(), "contract");
 
         let mut extra = batch.schema().metadata().clone();
-        extra.insert("atlas.extra".into(), "no".into());
+        extra.insert("dataplane.extra".into(), "no".into());
         let error = UnsignedQuadBatch::try_from_batch(batch_with_metadata(&batch, extra))
             .expect_err("extra metadata keys are contract-checked");
         assert_eq!(error.code(), "contract");

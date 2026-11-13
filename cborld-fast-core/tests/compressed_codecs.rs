@@ -101,7 +101,7 @@ fn multibase_payload(value: CborValue) -> CborValue {
 fn registered_context_roundtrips_with_provided_content() {
     let doc = json!({
         "@context": CTX_IRI,
-        "name": "Atlas"
+        "name": "Example"
     });
     let opts = options_with_context(json!({
         "@context": {"name": "http://schema.org/name"}
@@ -116,7 +116,7 @@ fn registered_context_roundtrips_with_provided_content() {
     // The provided context drives term-map construction: name = 100.
     assert_eq!(
         entry_value(&entries, &CborValue::Unsigned(100)),
-        CborValue::Text("Atlas".to_string())
+        CborValue::Text("Example".to_string())
     );
 }
 

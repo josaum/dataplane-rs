@@ -174,7 +174,10 @@ async fn get_schema_matches_the_contract_schema() {
     let schema = Schema::try_from(&result).unwrap();
     assert_eq!(&schema, quad_stream_schema().as_ref());
     assert_eq!(
-        schema.metadata().get("atlas.assurance").map(String::as_str),
+        schema
+            .metadata()
+            .get("dataplane.assurance")
+            .map(String::as_str),
         Some("unsigned")
     );
 
