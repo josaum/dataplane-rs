@@ -151,18 +151,71 @@ async fn buffer_pointing_outside_the_body_is_a_status_not_a_panic() {
 }
 
 #[tokio::test]
-async fn compressed_contract_streams_are_refused() {
+async fn zstd_buffer_declaring_a_huge_length_is_refused_before_allocation() {
     let server = serve("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let mut client = connect(server.local_addr()).await;
 
     let options = IpcWriteOptions::default()
         .try_with_compression(Some(CompressionType::ZSTD))
         .unwrap();
-    let frames = encode(contract_batch(8), options).await;
+    let mut frames = encode(contract_batch(8), options).await;
+    let (message, offset, _length) = first_buffer(&frames, 8);
+    let mut body = frames[message].data_body.to_vec();
+    body[offset..offset + 8].copy_from_slice(&(1_i64 << 62).to_le_bytes());
+    frames[message].data_body = body.into();
+
+    let put = put_code(&mut client, frames.clone()).await;
+    assert_eq!(put, Code::ResourceExhausted, "DoPut");
+    let exchange = exchange_code(&mut client, frames).await;
+    assert_eq!(exchange, Code::ResourceExhausted, "DoExchange");
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn zstd_round_trips_and_lz4_is_refused() {
+    let server = serve("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let mut client = connect(server.local_addr()).await;
+
+    let zstd = IpcWriteOptions::default()
+        .try_with_compression(Some(CompressionType::ZSTD))
+        .unwrap();
+    let frames = encode(contract_batch(8), zstd.clone()).await;
+    assert_eq!(put_code(&mut client, frames).await, Code::Ok, "zstd DoPut");
+    let response = client
+        .do_get(arrow_flight::Ticket::new("d".to_owned()))
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> =
+        arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+            response
+                .into_inner()
+                .map_err(arrow_flight::error::FlightError::from),
+        )
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 8);
+    assert_eq!(
+        batches[0],
+        contract_batch(8),
+        "zstd DoPut reads back unchanged"
+    );
+    let frames = encode(contract_batch(8), zstd).await;
+    assert_eq!(
+        exchange_code(&mut client, frames).await,
+        Code::Ok,
+        "zstd DoExchange"
+    );
+
+    let lz4 = IpcWriteOptions::default()
+        .try_with_compression(Some(CompressionType::LZ4_FRAME))
+        .unwrap();
+    let frames = encode(contract_batch(8), lz4).await;
     assert_eq!(
         put_code(&mut client, frames).await,
         Code::InvalidArgument,
-        "a compressed DoPut must be refused like a compressed IPC stream"
+        "lz4 stays refused"
     );
 
     server.shutdown().await.unwrap();

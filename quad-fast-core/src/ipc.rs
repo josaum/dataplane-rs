@@ -245,7 +245,7 @@ fn preflight_message(metadata: &[u8], saw_schema: &mut bool) -> Result<usize, Qu
         }
         MessageHeader::RecordBatch | MessageHeader::DictionaryBatch => {
             require_schema_first(*saw_schema, "record or dictionary batch")?;
-            preflight_batch_header(&message, body_len)?;
+            preflight_batch_header(&message, body_len, None)?;
         }
         other => return Err(unsupported_header(other)),
     }
@@ -276,7 +276,8 @@ fn unsupported_header(header: MessageHeader) -> QuadError {
 fn preflight_batch_header(
     message: &arrow_ipc::Message<'_>,
     body_len: usize,
-) -> Result<(), QuadError> {
+    zstd_body: Option<&[u8]>,
+) -> Result<usize, QuadError> {
     let (batch, kind) = match message.header_type() {
         MessageHeader::RecordBatch => (
             message
@@ -303,7 +304,21 @@ fn preflight_batch_header(
         }
         other => return Err(unsupported_header(other)),
     };
-    reject_compression(batch.compression().is_some(), kind)?;
+    let compressed = match (batch.compression(), zstd_body) {
+        (None, _) => false,
+        (Some(_), None) => return Err(compression_refused(kind)),
+        (Some(compression), Some(_)) => {
+            if compression.codec() != arrow_ipc::CompressionType::ZSTD
+                || compression.method() != arrow_ipc::BodyCompressionMethod::BUFFER
+            {
+                return Err(malformed(format!(
+                    "{kind} uses a compression other than per-buffer zstd; lz4 is refused \
+                     because its decoder is bounded only by the compression ratio"
+                )));
+            }
+            true
+        }
+    };
     if batch.length() < 0 {
         return Err(malformed(format!("{kind} declares a negative row count")));
     }
@@ -314,21 +329,68 @@ fn preflight_batch_header(
             )));
         }
     }
+    let mut declared = 0_usize;
     for buffer in batch.buffers().into_iter().flatten() {
-        let end = usize::try_from(buffer.offset())
+        let range = usize::try_from(buffer.offset())
             .ok()
             .zip(usize::try_from(buffer.length()).ok())
-            .and_then(|(offset, length)| offset.checked_add(length));
-        match end {
-            Some(end) if end <= body_len => {}
+            .and_then(|(offset, length)| Some((offset, offset.checked_add(length)?)));
+        let (start, end) = match range {
+            Some((start, end)) if end <= body_len => (start, end),
             _ => {
                 return Err(malformed(format!(
                     "{kind} declares a buffer outside its {body_len}-byte body"
                 )));
             }
+        };
+        if let (true, Some(body)) = (compressed, zstd_body) {
+            declared = declared
+                .checked_add(declared_buffer_length(body, start, end, kind)?)
+                .ok_or_else(|| malformed(format!("{kind} declares an overflowing size")))?;
         }
     }
-    Ok(())
+    Ok(declared)
+}
+
+/// Length a compressed buffer will occupy once decoded.
+///
+/// Each compressed buffer starts with its uncompressed length as a
+/// little-endian `i64`: `-1` means stored uncompressed, `0` empty, anything
+/// positive the size arrow will allocate up front. That size is returned
+/// here so the caller can charge it *before* arrow allocates it.
+fn declared_buffer_length(
+    body: &[u8],
+    start: usize,
+    end: usize,
+    kind: &str,
+) -> Result<usize, QuadError> {
+    if start == end {
+        return Ok(0);
+    }
+    let prefix: [u8; 8] = body
+        .get(start..end)
+        .and_then(|buffer| buffer.get(..8))
+        .and_then(|prefix| prefix.try_into().ok())
+        .ok_or_else(|| {
+            malformed(format!(
+                "{kind} has a compressed buffer shorter than its 8-byte length prefix"
+            ))
+        })?;
+    match i64::from_le_bytes(prefix) {
+        -1 => Ok(end - start - 8),
+        length => usize::try_from(length).map_err(|_negative| {
+            malformed(format!(
+                "{kind} declares a negative uncompressed buffer length"
+            ))
+        }),
+    }
+}
+
+fn compression_refused(kind: &str) -> QuadError {
+    malformed(format!(
+        "{kind} message declares a body compression; the decompressed size is attacker-chosen \
+         and unbounded, so compressed contract streams are refused"
+    ))
 }
 
 /// Verifies one encapsulated IPC message that arrives on its own.
@@ -355,7 +417,36 @@ pub fn preflight_ipc_message(metadata: &[u8], body: &[u8]) -> Result<(), QuadErr
     match message.header_type() {
         MessageHeader::NONE | MessageHeader::Schema => Ok(()),
         MessageHeader::RecordBatch | MessageHeader::DictionaryBatch => {
-            preflight_batch_header(&message, body.len())
+            preflight_batch_header(&message, body.len(), None).map(drop)
+        }
+        other => Err(unsupported_header(other)),
+    }
+}
+
+/// Like [`preflight_ipc_message`], but admits per-buffer zstd compression.
+///
+/// Returns the total uncompressed size the message's buffers declare (zero
+/// for an uncompressed message). Arrow allocates exactly that size before
+/// decompressing, so charge it against a budget and refuse the message when
+/// it does not fit *before* decoding. zstd is admitted because its decoder
+/// treats the declared size as a hard capacity; lz4 stays refused because
+/// its decoder keeps growing past it, bounded only by the compression ratio.
+///
+/// # Errors
+///
+/// Everything [`preflight_ipc_message`] refuses, except zstd compression,
+/// plus a compressed buffer shorter than its length prefix or declaring a
+/// negative length.
+pub fn preflight_ipc_message_zstd(metadata: &[u8], body: &[u8]) -> Result<usize, QuadError> {
+    let message = root_as_message(metadata).map_err(|error| {
+        malformed(format!(
+            "message metadata is not a valid flatbuffer: {error}"
+        ))
+    })?;
+    match message.header_type() {
+        MessageHeader::NONE | MessageHeader::Schema => Ok(0),
+        MessageHeader::RecordBatch | MessageHeader::DictionaryBatch => {
+            preflight_batch_header(&message, body.len(), Some(body))
         }
         other => Err(unsupported_header(other)),
     }
@@ -367,16 +458,6 @@ fn require_schema_first(saw_schema: bool, kind: &str) -> Result<(), QuadError> {
     }
     Err(malformed(format!(
         "{kind} message precedes the schema message"
-    )))
-}
-
-fn reject_compression(compressed: bool, kind: &str) -> Result<(), QuadError> {
-    if !compressed {
-        return Ok(());
-    }
-    Err(malformed(format!(
-        "{kind} message declares a body compression; the decompressed size is attacker-chosen \
-         and unbounded, so compressed contract streams are refused"
     )))
 }
 

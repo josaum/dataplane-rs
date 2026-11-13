@@ -8,9 +8,10 @@
 //! never served.
 //!
 //! Every ingest message (`DoPut`, `DoExchange`) passes
-//! [`quad_fast_core::preflight_ipc_message`] before Arrow sees it: body
-//! compression and delta dictionaries are refused, and every buffer must lie
-//! inside the body it arrived with. The Arrow decode itself then runs behind
+//! [`quad_fast_core::preflight_ipc_message_zstd`] before Arrow sees it: lz4
+//! and delta dictionaries are refused, every buffer must lie inside the body
+//! it arrived with, and the uncompressed size a zstd message declares is
+//! charged before Arrow allocates it. The Arrow decode itself then runs behind
 //! a panic barrier, so a malformed payload is a status, never a panic.
 
 use std::{
@@ -36,7 +37,7 @@ use arrow_flight::{
 use arrow_ipc::writer::IpcWriteOptions;
 use futures::{FutureExt, StreamExt, TryStreamExt, stream, stream::BoxStream};
 use quad_fast_core::{
-    QuadError, UnsignedQuadBatch, preflight_ipc_message, quad_stream_schema, validate_contract,
+    QuadError, UnsignedQuadBatch, preflight_ipc_message_zstd, quad_stream_schema, validate_contract,
 };
 use tokio::sync::{RwLock, mpsc};
 use tonic::{Request, Response, Status, Streaming};
@@ -159,8 +160,11 @@ fn serve_dataset(dataset: Arc<Dataset>, idle: Duration) -> ResponseStream<Flight
 ///
 /// Each message must arrive within `idle_timeout`, the stream may carry at
 /// most `max_messages_per_stream` messages, every message must pass
-/// [`preflight_ipc_message`], and, when `reservation` is given, its bytes are
+/// [`preflight_ipc_message_zstd`], and, when `reservation` is given, its bytes
+/// (received bytes plus any uncompressed size a zstd message declares) are
 /// charged against the dataset and store byte budgets before decoding.
+/// Without a reservation (`DoExchange`), a zstd message may declare at most
+/// `max_dataset_bytes`.
 fn guarded_ingest(
     incoming: Streaming<FlightData>,
     limits: DatasetLimits,
@@ -187,13 +191,24 @@ fn guarded_ingest(
                     limits.max_messages_per_stream
                 ))));
             }
-            preflight_ipc_message(&data.data_header, &data.data_body).map_err(|error| {
-                status_to_flight(Status::invalid_argument(format!("flight_decode: {error}")))
-            })?;
-            if let Some(reservation) = &reservation {
-                reservation
-                    .charge(data.data_header.len().saturating_add(data.data_body.len()))
-                    .map_err(status_to_flight)?;
+            let declared = preflight_ipc_message_zstd(&data.data_header, &data.data_body).map_err(
+                |error| {
+                    status_to_flight(Status::invalid_argument(format!("flight_decode: {error}")))
+                },
+            )?;
+            let received = data.data_header.len().saturating_add(data.data_body.len());
+            match &reservation {
+                Some(reservation) => reservation
+                    .charge(received.saturating_add(declared))
+                    .map_err(status_to_flight)?,
+                None if declared > limits.max_dataset_bytes => {
+                    return Err(status_to_flight(Status::resource_exhausted(format!(
+                        "resource_limit: dataset_bytes: a message declares {declared} \
+                         uncompressed bytes, over the limit of {}",
+                        limits.max_dataset_bytes
+                    ))));
+                }
+                None => {}
             }
             Ok(Some((data, (incoming, seen))))
         }
