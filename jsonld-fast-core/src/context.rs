@@ -517,6 +517,13 @@ fn process_context_object(
 /// of recursion for such chains. Cycles are not followed here; creating
 /// their definitions still reports the cyclic IRI mapping as an error.
 ///
+/// Behaviour change: before this ordering, a term was defined when first
+/// needed, so a dependency reached through another term's IRI could be
+/// defined by the recursive path, which does not apply `@protected`.
+/// Defining dependencies first, on the normal path, keeps their
+/// `@protected` flag; some protected-term outcomes therefore differ from
+/// earlier releases, matching pyld in the cases checked.
+///
 /// Chain length is still bounded by [`MAX_CONTEXT_RECURSION`]: when every
 /// link is a prefix (`"t0": "t1:x/"`), each IRI is longer than the next and
 /// a chain of `n` links holds `O(n^2)` bytes of IRIs (600 MB from about
@@ -592,6 +599,16 @@ fn term_dependencies<'map>(map: &'map Map<String, Value>, term: &str) -> Vec<&'m
     }
     let mut dependencies = Vec::new();
     for reference in references {
+        // A reference that is itself a term of this context (`"a:b"` as a
+        // key) is defined through it: define it first, on the normal path,
+        // so it keeps its `@protected` flag (the recursive path in IRI
+        // expansion defines terms unprotected).
+        if reference != term
+            && let Some((key, _)) = map.get_key_value(reference)
+            && !CONTROL_KEYS.contains(&key.as_str())
+        {
+            dependencies.push(key);
+        }
         let name = reference
             .split_once(':')
             .map_or(reference, |(prefix, _)| prefix);
