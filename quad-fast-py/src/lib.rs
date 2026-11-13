@@ -4,12 +4,12 @@
 //! PyO3 bindings for the `UnsignedQuadStream` contract and Jelly codec.
 //!
 //! Exposes five functions to Python as `quad_fast._native` (same layout as
-//! `office-parsers-rs/owl-fast-py`): [`build_quad_ipc`] builds one
+//! `office-parsers-rs/owl-fast-py`): `build_quad_ipc` builds one
 //! `UnsignedQuadStream` v1 batch from plain quad tuples and returns Arrow
-//! IPC stream bytes, [`read_quad_ipc`] decodes such bytes back into quad
-//! tuples, [`jelly_encode`] / [`jelly_decode`] translate between IPC
+//! IPC stream bytes, `read_quad_ipc` decodes such bytes back into quad
+//! tuples, `jelly_encode` / `jelly_decode` translate between IPC
 //! bytes and non-delimited protobuf-encoded Jelly `RdfStreamFrame` messages,
-//! and [`jsonld_to_quad_ipc`] decodes one inline-context JSON-LD document
+//! and `jsonld_to_quad_ipc` decodes one inline-context JSON-LD document
 //! into IPC bytes via `jsonld-fast-core`.
 //!
 //! The wire shapes are:
@@ -37,7 +37,7 @@
 //! rather than flattened into a node reference, and this binding never
 //! announces RDF-star on the Jelly wire.
 //!
-//! The conversion logic lives in [`convert`], which is pure Rust and unit
+//! The conversion logic lives in `convert`, which is pure Rust and unit
 //! tested without a Python interpreter (see `src/tests.rs`).
 //!
 //! Every call runs its encoding and decoding with the GIL released

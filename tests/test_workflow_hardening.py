@@ -12,6 +12,8 @@ a mutated copy that must fail it:
   call;
 - Dependabot updates every ecosystem that has a manifest in the repository,
   and holds the upgrades the consumers cannot take yet (pyo3 0.30, napi 3).
+- ci.yml builds the workspace's documentation, every feature on, with
+  rustdoc warnings as errors.
 
 Structure is read with PyYAML. A `uses:` line is also read as text, because
 the version comment after a pinned SHA is invisible to a YAML parser.
@@ -366,6 +368,29 @@ def test_deny_and_audit_run_and_cannot_block_a_release():
     assert_audit_contract(read(AUDIT), read(CI), read(RELEASE))
 
 
+def assert_rustdoc_gate(ci: str) -> None:
+    """ci.yml builds every crate's docs with all features and warnings denied."""
+    jobs = (load(ci).get("jobs") or {}).items()
+    gates = [
+        job
+        for _, job in jobs
+        for step in job.get("steps") or []
+        if re.search(
+            r"\bcargo doc --workspace\b(?=.*--no-deps)(?=.*--locked)(?=.*--all-features)",
+            str(step.get("run", "")),
+        )
+    ]
+    assert gates, "no ci.yml job runs `cargo doc --workspace --no-deps --locked --all-features`"
+    assert any(
+        "-D warnings" in str((job.get("env") or {}).get("RUSTDOCFLAGS", ""))
+        for job in gates
+    ), "the rustdoc job must set RUSTDOCFLAGS: -D warnings, or broken links pass"
+
+
+def test_the_documentation_builds_without_warnings_in_ci():
+    assert_rustdoc_gate(read(CI))
+
+
 def test_dependabot_covers_every_ecosystem_present():
     ecosystems = present_ecosystems(ROOT)
     assert {"cargo", "github-actions", "uv", "npm"} <= {name for name, _ in ecosystems}
@@ -423,6 +448,10 @@ def audit(path: Path, original: str, replacement: str) -> None:
     assert_audit_contract(texts[AUDIT], texts[CI], texts[RELEASE], texts[DENY_CONFIG])
 
 
+def rustdoc(path: Path, original: str, replacement: str) -> None:
+    assert_rustdoc_gate(read(path).replace(original, replacement, 1))
+
+
 def dependabot(path: Path, original: str, replacement: str) -> None:
     assert_dependabot_contract(
         read(path).replace(original, replacement, 1), present_ecosystems(ROOT)
@@ -430,6 +459,10 @@ def dependabot(path: Path, original: str, replacement: str) -> None:
 
 
 MUTATIONS = [
+    # rustdoc gate
+    (rustdoc, CI, "      RUSTDOCFLAGS: -D warnings\n", ""),
+    (rustdoc, CI, "cargo doc --workspace --no-deps --locked --all-features", "cargo doc --workspace --no-deps --locked"),
+    (rustdoc, CI, "cargo doc --workspace --no-deps --locked --all-features", "cargo doc -p quad-fast-core --no-deps --locked --all-features"),
     # 1. pinning
     (pinned, CI, CHECKOUT, "actions/checkout@v4"),
     (pinned, CI, CHECKOUT, "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"),
