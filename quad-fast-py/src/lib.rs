@@ -419,6 +419,8 @@ fn jelly_decode(
 /// Panics on purpose, so a test can prove a panic surfaces as an exception.
 ///
 /// Compiled only with the `panic-probe` feature, which no release enables.
+/// The panic happens with the GIL released, as the real calls do their work,
+/// so the test covers the path from `py.detach` back to the function boundary.
 /// `tests/test_panic.py` calls it in a child interpreter and requires
 /// `pyo3_runtime.PanicException` while the process exits normally.
 ///
@@ -428,8 +430,8 @@ fn jelly_decode(
 #[cfg(feature = "panic-probe")]
 #[pyfunction]
 #[pyo3(name = "_panic_probe")]
-fn panic_probe() {
-    panic!("panic-probe: deliberate panic");
+fn panic_probe(py: Python<'_>) {
+    py.detach(|| panic!("panic-probe: deliberate panic"))
 }
 
 /// Registers the `quad_fast._native` extension module.

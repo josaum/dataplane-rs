@@ -50,8 +50,8 @@ def beats_during(call) -> tuple[float, int]:
 
 
 @pytest.fixture(scope="module")
-def ipc() -> bytes:
-    quads = [
+def quads() -> list[tuple]:
+    return [
         (
             ("iri", f"http://example.com/s{index}"),
             "http://example.com/p",
@@ -59,6 +59,10 @@ def ipc() -> bytes:
         )
         for index in range(QUADS)
     ]
+
+
+@pytest.fixture(scope="module")
+def ipc(quads: list[tuple]) -> bytes:
     return quad_fast.build_quad_ipc(
         quads, max_quads=BIG, max_retained_term_bytes=BIG, max_ipc_bytes=BIG
     )
@@ -79,12 +83,16 @@ def jsonld() -> str:
 
 
 CALLS = {
-    "jelly_decode": lambda ipc, frames, jsonld: quad_fast.jelly_decode(
+    # Converting the Python tuples holds the GIL; building the batch does not.
+    "build_quad_ipc": lambda quads, ipc, frames, jsonld: quad_fast.build_quad_ipc(
+        quads, max_quads=BIG, max_retained_term_bytes=BIG, max_ipc_bytes=BIG
+    ),
+    "jelly_decode": lambda quads, ipc, frames, jsonld: quad_fast.jelly_decode(
         frames, max_quads=BIG, max_retained_term_bytes=BIG, max_ipc_bytes=BIG
     ),
-    "jelly_encode": lambda ipc, frames, jsonld: quad_fast.jelly_encode(ipc),
-    "read_quad_ipc": lambda ipc, frames, jsonld: quad_fast.read_quad_ipc(ipc),
-    "jsonld_to_quad_ipc": lambda ipc, frames, jsonld: quad_fast.jsonld_to_quad_ipc(
+    "jelly_encode": lambda quads, ipc, frames, jsonld: quad_fast.jelly_encode(ipc),
+    "read_quad_ipc": lambda quads, ipc, frames, jsonld: quad_fast.read_quad_ipc(ipc),
+    "jsonld_to_quad_ipc": lambda quads, ipc, frames, jsonld: quad_fast.jsonld_to_quad_ipc(
         jsonld,
         max_input_bytes=BIG,
         max_nodes=BIG,
@@ -96,9 +104,10 @@ CALLS = {
 
 
 @pytest.mark.parametrize("name", sorted(CALLS))
-def test_another_thread_runs_during_a_long_call(name, ipc, frames, jsonld):
+def test_another_thread_runs_during_a_long_call(name, quads, ipc, frames, jsonld):
     call = CALLS[name]
-    seconds, inside = beats_during(lambda: call(ipc, frames, jsonld))
+    seconds, inside = beats_during(lambda: call(quads, ipc, frames, jsonld))
+    print(f"{name}: {seconds:.3f}s, {inside} timestamps inside")
     assert seconds >= MIN_CALL_SECONDS, (
         f"{name} took {seconds:.3f}s; the workload is too small to observe the GIL"
     )
