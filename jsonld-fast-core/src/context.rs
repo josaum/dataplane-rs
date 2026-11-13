@@ -492,7 +492,7 @@ fn process_context_object(
         .filter(|key| !CONTROL_KEYS.contains(&key.as_str()))
         .collect();
     terms.sort();
-    for term in dependency_order(map, &terms) {
+    for term in dependency_order(map, &terms)? {
         create_term_definition(
             result,
             map,
@@ -516,36 +516,61 @@ fn process_context_object(
 /// first, with an explicit stack, leaves each creation at most one level
 /// of recursion for such chains. Cycles are not followed here; creating
 /// their definitions still reports the cyclic IRI mapping as an error.
+///
+/// Chain length is still bounded by [`MAX_CONTEXT_RECURSION`]: when every
+/// link is a prefix (`"t0": "t1:x/"`), each IRI is longer than the next and
+/// a chain of `n` links holds `O(n^2)` bytes of IRIs (600 MB from about
+/// 500 KB at 20,000 links). The bound is enforced here, on the explicit
+/// stack, before any definition is created.
+///
+/// # Errors
+///
+/// [`JsonLdError::ResourceLimit`] with [`JsonLdResource::ContextRecursion`]
+/// when a dependency chain is longer than [`MAX_CONTEXT_RECURSION`].
 fn dependency_order<'map>(
     map: &'map Map<String, Value>,
     terms: &[&'map String],
-) -> Vec<&'map String> {
+) -> Result<Vec<&'map String>, JsonLdError> {
     let mut order: Vec<&String> = Vec::with_capacity(terms.len());
-    let mut emitted: HashSet<&str> = HashSet::new();
+    let mut chain: HashMap<&str, usize> = HashMap::new();
     let mut visiting: HashSet<&str> = HashSet::new();
     for &root in terms {
         let mut stack: Vec<(&String, bool)> = vec![(root, false)];
         while let Some((term, finished)) = stack.pop() {
             if finished {
                 visiting.remove(term.as_str());
-                if emitted.insert(term.as_str()) {
+                if !chain.contains_key(term.as_str()) {
+                    let length = term_dependencies(map, term)
+                        .iter()
+                        .filter_map(|dependency| chain.get(dependency.as_str()))
+                        .max()
+                        .map_or(1, |longest| longest.saturating_add(1));
+                    if length > MAX_CONTEXT_RECURSION {
+                        return Err(JsonLdError::ResourceLimit {
+                            resource: JsonLdResource::ContextRecursion,
+                            limit: MAX_CONTEXT_RECURSION,
+                            observed: length,
+                        });
+                    }
+                    chain.insert(term.as_str(), length);
                     order.push(term);
                 }
                 continue;
             }
-            if emitted.contains(term.as_str()) || !visiting.insert(term.as_str()) {
+            if chain.contains_key(term.as_str()) || !visiting.insert(term.as_str()) {
                 continue;
             }
             stack.push((term, true));
             for dependency in term_dependencies(map, term) {
-                if !emitted.contains(dependency.as_str()) && !visiting.contains(dependency.as_str())
+                if !chain.contains_key(dependency.as_str())
+                    && !visiting.contains(dependency.as_str())
                 {
                     stack.push((dependency, false));
                 }
             }
         }
     }
-    order
+    Ok(order)
 }
 
 /// Terms of the same local context that defining `term` would define first.
@@ -557,7 +582,7 @@ fn term_dependencies<'map>(map: &'map Map<String, Value>, term: &str) -> Vec<&'m
     match map.get(term) {
         Some(Value::String(iri)) => references.push(iri),
         Some(Value::Object(definition)) => {
-            for keyword in ["@id", "@reverse", "@type"] {
+            for keyword in ["@id", "@reverse", "@type", "@index"] {
                 if let Some(Value::String(iri)) = definition.get(keyword) {
                     references.push(iri);
                 }

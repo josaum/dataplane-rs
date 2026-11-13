@@ -492,18 +492,9 @@ fn prefix_chain_in_flat_context() {
         }
         terms.insert(format!("t{DEPTH}"), json!("http://example.com/"));
         let input = entries(vec![("@context", Value::Object(terms)), ("t0", json!("v"))]);
-        // A legal context: it must expand or be refused, never abort.
-        match expand(&input, &opts()) {
-            Ok(expanded) => {
-                println!(
-                    "expanded: {} node(s)",
-                    expanded.as_array().map_or(0, Vec::len)
-                );
-                leak(expanded);
-            }
-            Err(error) => println!("refused: {error}"),
-        }
-        leak(input);
+        // Refused by chain length on an explicit stack, never by overflow.
+        let result = expand(&input, &opts());
+        expect_err(input, result);
     });
 }
 
