@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-use jsonld_fast_core::{JsonLdOptions, compact, expand};
+use jsonld_fast_core::{JsonLdOptions, compact, expand, frame};
 use serde_json::{Map, Value, json};
 
 /// A term expanding to a 1 MiB IRI, used by `uses` nodes: about 1 MiB of
@@ -96,4 +96,93 @@ fn long_type_map_key_is_charged() {
     let document = json!({"@context": Value::Object(context), "@graph": nodes});
     let error = expand(&document, &JsonLdOptions::default()).expect_err("refused");
     assert!(error.to_string().contains("output_bytes"), "{error}");
+}
+
+/// An `@id` map key expanding through a 64 KiB prefix supplies each item's
+/// `@id` after the item was charged: 2,000 entries turned 88 KB of input
+/// into 131 MB.
+#[test]
+fn id_map_keys_are_charged() {
+    let prefix = format!("http://example.com/{}/", "a".repeat(64 * 1024));
+    let mut entries = Map::new();
+    for index in 0..2_000 {
+        entries.insert(format!("p:{index}"), json!({}));
+    }
+    let mut context = Map::new();
+    context.insert("p".to_owned(), Value::String(prefix));
+    context.insert(
+        "m".to_owned(),
+        json!({"@id": "http://example.com/m", "@container": "@id"}),
+    );
+    let document = json!({
+        "@context": Value::Object(context),
+        "@id": "http://example.com/root",
+        "m": Value::Object(entries)
+    });
+    let error = expand(&document, &JsonLdOptions::default()).expect_err("refused");
+    assert!(error.to_string().contains("output_bytes"), "{error}");
+}
+
+/// A property-valued `@index` whose property is a 64 KiB IRI is attached
+/// to each of 2,000 items after they were charged: 131 KB in, 131 MB out.
+#[test]
+fn property_valued_index_is_charged() {
+    let iri = format!("http://example.com/{}", "a".repeat(64 * 1024));
+    let mut entries = Map::new();
+    for index in 0..2_000 {
+        entries.insert(
+            format!("k{index}"),
+            json!({"@id": format!("http://example.com/n{index}")}),
+        );
+    }
+    let mut context = Map::new();
+    context.insert("idx".to_owned(), Value::String(iri));
+    context.insert(
+        "m".to_owned(),
+        json!({"@id": "http://example.com/m", "@container": "@index", "@index": "idx"}),
+    );
+    let document = json!({
+        "@context": Value::Object(context),
+        "@id": "http://example.com/root",
+        "m": Value::Object(entries)
+    });
+    let error = expand(&document, &JsonLdOptions::default()).expect_err("refused");
+    assert!(error.to_string().contains("output_bytes"), "{error}");
+}
+
+/// Legitimate `@embed: @always` framing that main completes: 20,000 items
+/// each embedding one of 10 shared 2 KB nodes (1.9 MB in, 42 MB out). Each
+/// compacted string must be charged once, and the default must fit it.
+#[test]
+fn embed_always_over_shared_nodes_fits_the_default_budget() {
+    let description = "d".repeat(2_000);
+    let mut graph: Vec<Value> = (0..10)
+        .map(|org| {
+            json!({"@id": format!("http://example.com/org{org}"), "@type": "http://s/Org",
+                "http://s/desc": description})
+        })
+        .collect();
+    for item in 0..20_000 {
+        graph.push(
+            json!({"@id": format!("http://example.com/item{item}"), "@type": "http://s/Item",
+            "http://s/org": {"@id": format!("http://example.com/org{}", item % 10)}}),
+        );
+    }
+    let document = json!({"@graph": graph});
+    let frame_value =
+        json!({"@context": {"@vocab": "http://s/"}, "@type": "Item", "@embed": "@always"});
+    let options = JsonLdOptions {
+        limits: jsonld_fast_core::JsonLdLimits {
+            max_nodes: usize::MAX / 2,
+            ..jsonld_fast_core::JsonLdLimits::default()
+        },
+        ..JsonLdOptions::default()
+    };
+    let framed = frame(&document, &frame_value, &options).expect("legitimate framing fits");
+    assert!(
+        framed
+            .get("@graph")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.len() == 20_000)
+    );
 }

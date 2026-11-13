@@ -74,17 +74,19 @@ pub(crate) const FRAME_STACK_PER_EMBED_LEVEL: usize = 128 * 1024;
 pub(crate) const FRAME_WORKER_BASE_STACK: usize = 1024 * 1024;
 
 /// Output bytes allowed per byte of input when no explicit
-/// [`JsonLdLimits::max_output_bytes`] is set: 16.
+/// [`JsonLdLimits::max_output_bytes`] is set: 32.
 ///
 /// Only produced strings are charged (keys, IRIs, values), not
-/// punctuation, so legitimate output is about the size of the input or a
-/// small multiple of it when short terms become long IRIs. Measured: the
-/// 26 W3C fixtures that expand need at most 0.8 charged bytes per byte of
-/// input text, and the benchmark documents (up to 1,024 nodes) fit inside
-/// [`OUTPUT_BYTES_FLOOR`] alone. 16 leaves a wide margin for documents
-/// built from very short terms. A term mapped to a 1 MiB IRI and used 128
-/// times is 128 times its input and is refused.
-pub const OUTPUT_BYTES_PER_INPUT_BYTE: usize = 16;
+/// punctuation. Dense data with one-letter keys that expand to long IRIs
+/// is the legitimate worst case. Measured on optimized builds: 1,000,000
+/// nodes with 8 one-letter keys coerced to `xsd:integer` under a
+/// 70-character namespace (66 MB of input text) need between 12 and 16
+/// times their input; a schema.org-like graph of 150,000 people (47 MB)
+/// needs less than 4. 32 leaves about twice the densest measured need.
+/// Amplification attacks run at 128 times their input (a 1 MiB IRI used
+/// 128 times) to over 1,000 times (2,000 `@id`-map keys through a 64 KiB
+/// prefix) and are refused.
+pub const OUTPUT_BYTES_PER_INPUT_BYTE: usize = 32;
 
 /// Output bytes always allowed regardless of input size: 16 MiB.
 ///

@@ -392,11 +392,12 @@ impl Compactor {
     /// Compaction can amplify as expansion does: a context term with a
     /// long name chosen for a short IRI is copied at every use. Each object
     /// compaction builds is charged its keys and direct strings once, when
-    /// it is built; a scalar (a compacted value) is charged its string.
+    /// it is built. A value that compacts to a bare string is not charged
+    /// here: it becomes a direct string of its parent, which charges it.
     fn charge_output(&self, value: &Value) -> Result<(), JsonLdError> {
         let mut bytes = 0_usize;
         match value {
-            Value::String(text) => bytes = text.len(),
+            Value::String(_) => {}
             Value::Object(map) => {
                 for (key, item) in map {
                     bytes = bytes.saturating_add(key.len());

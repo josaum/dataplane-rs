@@ -948,6 +948,7 @@ impl Expander {
                 // Spec step 13.8.3.7.1: inside @id/@index maps combined with
                 // @graph, items become graph objects unless they already are.
                 if container.graph && !item.as_object().is_some_and(is_graph_object) {
+                    self.charge_output("@graph".len())?;
                     item = Value::Object(Map::from_iter([(
                         "@graph".to_owned(),
                         Value::Array(vec![item]),
@@ -963,6 +964,15 @@ impl Expander {
                     // with the index-mapping property (section 4.6.1.1).
                     if !is_none_index && !object.contains_key("@index") {
                         if let Some(index_iri) = &definition.index {
+                            // The item was charged when it was expanded: the
+                            // index property IRI (a key) and the copied map
+                            // key (its value) are new strings.
+                            self.charge_output(
+                                index_iri
+                                    .len()
+                                    .saturating_add("@value".len())
+                                    .saturating_add(index.len()),
+                            )?;
                             let index_value = Value::Object(Map::from_iter([(
                                 "@value".to_owned(),
                                 Value::String(index.clone()),
@@ -974,6 +984,7 @@ impl Expander {
                                 existing.push(index_value);
                             }
                         } else {
+                            self.charge_output("@index".len().saturating_add(index.len()))?;
                             object.insert("@index".to_owned(), Value::String(index.clone()));
                         }
                     }
@@ -991,6 +1002,9 @@ impl Expander {
                         let id = document_relative_index
                             .clone()
                             .unwrap_or_else(|| index.clone());
+                        // The map key expands (through a prefix, say) to an
+                        // `@id` the already-charged item did not hold.
+                        self.charge_output("@id".len().saturating_add(id.len()))?;
                         object.insert("@id".to_owned(), Value::String(id));
                     }
                 } else if container.type_ && !is_none_index {
