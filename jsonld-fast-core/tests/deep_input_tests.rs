@@ -436,3 +436,77 @@ fn yaml_nested_block_sequences() {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// Inputs within the default depth limit must not depend on the caller's
+// stack either: 60 levels is legal, and does not fit a 256 KiB debug stack
+// inline (about 15 object levels do).
+// ---------------------------------------------------------------------------
+
+/// Nesting just under the default `max_depth` of 128.
+const LEGAL_DEPTH: usize = 60;
+
+fn legal_deep_property() -> Value {
+    let mut value = json!("leaf");
+    for _ in 0..LEGAL_DEPTH {
+        value = object("http://example.com/p", value);
+    }
+    value
+}
+
+#[test]
+fn within_limit_expand_compact_to_quads_frame() {
+    isolated("within_limit_expand_compact_to_quads_frame", || {
+        let input = legal_deep_property();
+        let options = opts();
+        let expanded = expand(&input, &options).expect("legal depth expands");
+        leak(expanded);
+        let compacted = compact(&input, &json!({"p": "http://example.com/p"}), &options)
+            .expect("legal depth compacts");
+        leak(compacted);
+        let quads = to_quads(&input, &options, None).expect("legal depth converts");
+        assert_eq!(quads[0].num_rows(), LEGAL_DEPTH);
+        let framed = frame(&input, &json!({}), &options).expect("legal depth frames");
+        leak(framed);
+        leak(input);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Flat inputs whose processing could still recurse per element.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "unresolved: a flat prefix chain recurses up to MAX_CONTEXT_RECURSION (32) \
+            create-term-definition frames before the counter refuses it, which overflows a \
+            256 KiB stack in a debug build; the pre-scan cannot see it because the JSON is flat"]
+fn prefix_chain_in_flat_context() {
+    isolated("prefix_chain_in_flat_context", || {
+        // `t0` is `t1:x`, `t1` is `t2:x`, ...: flat JSON, but defining `t0`
+        // resolves the whole chain.
+        let mut terms = Map::new();
+        for index in 0..DEPTH {
+            terms.insert(format!("t{index}"), json!(format!("t{}:x", index + 1)));
+        }
+        terms.insert(format!("t{DEPTH}"), json!("http://example.com/"));
+        let input = entries(vec![("@context", Value::Object(terms)), ("t0", json!("v"))]);
+        let result = expand(&input, &opts());
+        expect_err(input, result);
+    });
+}
+
+#[test]
+fn long_flat_list_to_quads() {
+    isolated("long_flat_list_to_quads", || {
+        let items: Vec<Value> = (0..DEPTH).map(|index| json!(index)).collect();
+        let input = entries(vec![
+            ("@id", json!("http://example.com/s")),
+            ("http://example.com/p", object("@list", Value::Array(items))),
+        ]);
+        let batches = to_quads(&input, &opts(), None).expect("a flat list converts");
+        assert_eq!(batches[0].num_rows(), DEPTH * 2 + 1);
+        let round_tripped = from_quads(&batches).expect("a flat list reassembles");
+        leak(round_tripped);
+        leak(input);
+    });
+}

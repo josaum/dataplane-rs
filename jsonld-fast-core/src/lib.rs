@@ -133,9 +133,11 @@
 //! explicit heap stack before any recursive code — including `clone` —
 //! touches it, so a value nested 100,000 levels deep is refused instead of
 //! overflowing the native stack. Native stack use per level is large in
-//! unoptimized builds (about 17 KiB per object level in expansion), so
-//! documents *within* the default depth of 128 still need a stack of a few
-//! MiB in a debug build; run deep inputs on such a thread.
+//! unoptimized builds (about 17 KiB per object level in expansion), so a
+//! document *within* the limit but deeper than a few levels is processed
+//! on a short-lived worker thread whose stack is sized from its measured
+//! depth; shallow documents run inline. The caller's stack size therefore
+//! never decides whether a legal document can be processed.
 //!
 //! # Deliberate deviations (all fail closed)
 //!
@@ -242,7 +244,8 @@ pub fn parse_document(text: &str, limits: &JsonLdLimits) -> Result<Value, JsonLd
 /// Returns the typed [`JsonLdError`] raised by context processing, refused
 /// features, malformed documents, or an exceeded resource limit.
 pub fn expand(document: &Value, options: &JsonLdOptions) -> Result<Value, JsonLdError> {
-    expand::expand_document(document, options)
+    let depth = guard::check_nesting(document, options.limits.max_depth)?;
+    guard::run_sized(depth, || expand::expand_document(document, options))
 }
 
 /// Compacts a JSON-LD document against an inline context
@@ -270,17 +273,20 @@ pub fn compact(
 ) -> Result<Value, JsonLdError> {
     // The context is caller-built and is cloned below; `Clone` recurses, so
     // its nesting is bounded before anything touches it.
-    guard::check_nesting(context, options.limits.max_depth)?;
-    let expanded = expand::expand_document(document, options)?;
-    let context_value = match context {
-        Value::Object(map) => map
-            .get("@context")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(map.clone())),
-        other => other.clone(),
-    };
-    let compacted = compact::compact_expanded(&expanded, &context_value, options)?;
-    Ok(compact::attach_context(compacted, &context_value))
+    let context_depth = guard::check_nesting(context, options.limits.max_depth)?;
+    let document_depth = guard::check_nesting(document, options.limits.max_depth)?;
+    guard::run_sized(context_depth.max(document_depth), || {
+        let expanded = expand::expand_document(document, options)?;
+        let context_value = match context {
+            Value::Object(map) => map
+                .get("@context")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(map.clone())),
+            other => other.clone(),
+        };
+        let compacted = compact::compact_expanded(&expanded, &context_value, options)?;
+        Ok(compact::attach_context(compacted, &context_value))
+    })
 }
 
 /// Frames `document` with `frame` (JSON-LD 1.1 Framing REC section 4.1).
@@ -313,7 +319,11 @@ pub fn frame(
     frame: &Value,
     options: &JsonLdOptions,
 ) -> Result<Value, JsonLdError> {
-    frame::frame_document(document, frame, options)
+    let frame_depth = guard::check_nesting(frame, options.limits.max_depth)?;
+    let document_depth = guard::check_nesting(document, options.limits.max_depth)?;
+    guard::run_sized(frame_depth.max(document_depth), || {
+        frame::frame_document(document, frame, options)
+    })
 }
 
 /// Deserializes a JSON-LD document to `UnsignedQuadStream` batches.
@@ -334,8 +344,11 @@ pub fn to_quads(
     options: &JsonLdOptions,
     provenance: Option<&SourceProvenance>,
 ) -> Result<Vec<RecordBatch>, JsonLdError> {
-    let expanded = expand::expand_document(document, options)?;
-    let quads = to_rdf::expanded_to_quads(&expanded)?;
+    let depth = guard::check_nesting(document, options.limits.max_depth)?;
+    let quads = guard::run_sized(depth, || {
+        let expanded = expand::expand_document(document, options)?;
+        to_rdf::expanded_to_quads(&expanded)
+    })?;
     let mut builder = QuadBatchBuilder::new(options.quad_limits);
     for quad in &quads {
         builder.push(quad.as_ref(), provenance)?;
