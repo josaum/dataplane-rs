@@ -482,9 +482,6 @@ fn within_limit_expand_compact_to_quads_frame() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "unresolved: a flat prefix chain recurses up to MAX_CONTEXT_RECURSION (32) \
-            create-term-definition frames before the counter refuses it, which overflows a \
-            256 KiB stack in a debug build; the pre-scan cannot see it because the JSON is flat"]
 fn prefix_chain_in_flat_context() {
     isolated("prefix_chain_in_flat_context", || {
         // `t0` is `t1:x`, `t1` is `t2:x`, ...: flat JSON, but defining `t0`
@@ -495,8 +492,18 @@ fn prefix_chain_in_flat_context() {
         }
         terms.insert(format!("t{DEPTH}"), json!("http://example.com/"));
         let input = entries(vec![("@context", Value::Object(terms)), ("t0", json!("v"))]);
-        let result = expand(&input, &opts());
-        expect_err(input, result);
+        // A legal context: it must expand or be refused, never abort.
+        match expand(&input, &opts()) {
+            Ok(expanded) => {
+                println!(
+                    "expanded: {} node(s)",
+                    expanded.as_array().map_or(0, Vec::len)
+                );
+                leak(expanded);
+            }
+            Err(error) => println!("refused: {error}"),
+        }
+        leak(input);
     });
 }
 

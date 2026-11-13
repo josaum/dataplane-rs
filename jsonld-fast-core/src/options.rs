@@ -34,7 +34,10 @@ pub const DEFAULT_MAX_DEPTH: usize = 128;
 ///   section 4.2.2 step 21.2), and
 /// - a term definition created to resolve another term's prefix (section
 ///   4.2.2 step 14, via IRI expansion) — `{"a": "b:x", "b": "c:x", ...}`
-///   is **flat** JSON of arbitrary chain length.
+///   is **flat** JSON of arbitrary chain length. Terms of one local context
+///   are now defined dependencies-first with an explicit stack, so such a
+///   chain no longer recurses; the bound still covers dependencies the
+///   ordering does not see.
 ///
 /// Both are refused past this depth with
 /// [`crate::JsonLdError::ResourceLimit`] and

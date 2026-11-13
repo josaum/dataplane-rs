@@ -13,7 +13,10 @@
 //! `@direction`, `@nest` values, and the full 1.1 `@container` grammar
 //! including `@language` maps and property-based `@index` (section 4.6.1.1).
 
-use std::{collections::HashMap, rc::Rc};
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use serde_json::{Map, Value};
 
@@ -489,7 +492,7 @@ fn process_context_object(
         .filter(|key| !CONTROL_KEYS.contains(&key.as_str()))
         .collect();
     terms.sort();
-    for term in terms {
+    for term in dependency_order(map, &terms) {
         create_term_definition(
             result,
             map,
@@ -501,6 +504,82 @@ fn process_context_object(
         )?;
     }
     Ok(())
+}
+
+/// Orders `terms` so that every term comes after the terms of the same
+/// local context it depends on.
+///
+/// Creating a term definition defines its dependencies first (a compact
+/// IRI's prefix, or a term referenced by another term's IRI), recursively;
+/// a flat chain `{"t0": "t1:x", "t1": "t2:x", ...}` would recurse once per
+/// link, which no document-nesting budget sees. Visiting dependencies
+/// first, with an explicit stack, leaves each creation at most one level
+/// of recursion for such chains. Cycles are not followed here; creating
+/// their definitions still reports the cyclic IRI mapping as an error.
+fn dependency_order<'map>(
+    map: &'map Map<String, Value>,
+    terms: &[&'map String],
+) -> Vec<&'map String> {
+    let mut order: Vec<&String> = Vec::with_capacity(terms.len());
+    let mut emitted: HashSet<&str> = HashSet::new();
+    let mut visiting: HashSet<&str> = HashSet::new();
+    for &root in terms {
+        let mut stack: Vec<(&String, bool)> = vec![(root, false)];
+        while let Some((term, finished)) = stack.pop() {
+            if finished {
+                visiting.remove(term.as_str());
+                if emitted.insert(term.as_str()) {
+                    order.push(term);
+                }
+                continue;
+            }
+            if emitted.contains(term.as_str()) || !visiting.insert(term.as_str()) {
+                continue;
+            }
+            stack.push((term, true));
+            for dependency in term_dependencies(map, term) {
+                if !emitted.contains(dependency.as_str()) && !visiting.contains(dependency.as_str())
+                {
+                    stack.push((dependency, false));
+                }
+            }
+        }
+    }
+    order
+}
+
+/// Terms of the same local context that defining `term` would define first.
+fn term_dependencies<'map>(map: &'map Map<String, Value>, term: &str) -> Vec<&'map String> {
+    let mut references: Vec<&str> = Vec::new();
+    if let Some((prefix, _)) = term.split_once(':') {
+        references.push(prefix);
+    }
+    match map.get(term) {
+        Some(Value::String(iri)) => references.push(iri),
+        Some(Value::Object(definition)) => {
+            for keyword in ["@id", "@reverse", "@type"] {
+                if let Some(Value::String(iri)) = definition.get(keyword) {
+                    references.push(iri);
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut dependencies = Vec::new();
+    for reference in references {
+        let name = reference
+            .split_once(':')
+            .map_or(reference, |(prefix, _)| prefix);
+        if name == term || name.starts_with('@') {
+            continue;
+        }
+        if let Some((key, _)) = map.get_key_value(name)
+            && !CONTROL_KEYS.contains(&key.as_str())
+        {
+            dependencies.push(key);
+        }
+    }
+    dependencies
 }
 
 /// Creates the definition of `term` from `local`, recursing on dependencies.

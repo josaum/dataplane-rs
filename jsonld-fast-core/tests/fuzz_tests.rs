@@ -1283,10 +1283,13 @@ fn regression_expanded_json_literal_is_charged_to_the_budget() {
 /// `{"t0":"t1:x","t1":"t2:x",…}` is depth-2 JSON, so neither
 /// `serde_json`'s own 128-level parse limit nor `JsonLdLimits::max_depth`
 /// (which counts *document* nesting) ever saw it. A 7,853-byte document
-/// that `parse_document` accepted killed the process; the chain is now
-/// bounded by `MAX_CONTEXT_RECURSION`.
+/// that `parse_document` accepted killed the process. It was then refused
+/// by `MAX_CONTEXT_RECURSION`; terms are now defined dependencies-first
+/// with an explicit stack, so the chain needs no recursion and expands
+/// per spec: `t4999` (`…chain#x`) does not end in a gen-delim, so it is no
+/// prefix, and `t0` expands to the absolute IRI `t1:x`.
 #[test]
-fn regression_flat_prefix_chain_fails_closed() {
+fn regression_flat_prefix_chain_expands_without_recursion() {
     let mut entries = Vec::new();
     let length = 5_000;
     for index in 0..length {
@@ -1301,12 +1304,8 @@ fn regression_flat_prefix_chain_fails_closed() {
     let text_form = serde_json::to_string(&document).expect("serializes");
     let parsed = parse_document(&text_form, &JsonLdLimits::default())
         .expect("a flat prefix chain is ordinary JSON and parses");
-    let error = expand(&parsed, &JsonLdOptions::default()).expect_err("the chain must fail closed");
-    assert_eq!(error.code(), "resource_limit");
-    assert!(
-        error.to_string().contains("context_recursion"),
-        "the context-recursion budget must name itself: {error}"
-    );
+    let expanded = expand(&parsed, &JsonLdOptions::default()).expect("the chain expands");
+    assert!(expanded[0].get("t1:x").is_some(), "{expanded}");
 }
 
 /// Regression: nested scoped contexts recursed through
