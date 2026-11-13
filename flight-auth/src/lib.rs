@@ -609,12 +609,23 @@ impl AuthConfig {
     fn validation(&self, algorithm: Algorithm) -> Validation {
         let mut validation = Validation::new(algorithm);
         validation.leeway = CLOCK_SKEW_LEEWAY_SECS;
+        // jsonwebtoken leaves `nbf` unchecked by default, which accepts a
+        // token minted to start in the future. Same leeway as `exp`.
+        validation.validate_nbf = true;
+        // jsonwebtoken checks a configured issuer or audience only when the
+        // claim is present; requiring it makes the refusal of a token that
+        // omits it independent of the `AuthClaim` field shape.
+        let mut required = vec!["exp"];
         if let Some(issuer) = &self.issuer {
             validation.set_issuer(&[issuer.as_str()]);
+            required.push("iss");
         }
         if let Some(audience) = &self.audience {
             validation.set_audience(&[audience.as_str()]);
-        } else {
+            required.push("aud");
+        }
+        validation.set_required_spec_claims(&required);
+        if self.audience.is_none() {
             // Preserve the explicitly unscoped test/dev mode. Production
             // runtime surfaces configure the canonical audience.
             validation.validate_aud = false;
@@ -1235,6 +1246,89 @@ ukGKdvjAChvcppTqeYZFUdgKDvTxUZHbOuGfKuX4aZ8zXHzqmcMeUe2TTQ==
             assert_refused(&dual_material_verifier(true), &unsigned);
             assert_refused(&dual_material_verifier(false), &unsigned);
             assert_refused(&verifier(), &unsigned);
+        }
+    }
+
+    #[test]
+    fn token_that_is_not_yet_valid_is_refused() {
+        #[derive(Serialize)]
+        struct Future {
+            #[serde(flatten)]
+            claim: CanonicalPythonAccessClaim,
+            nbf: u64,
+        }
+        let now = unix_now();
+        let future = Future {
+            claim: CanonicalPythonAccessClaim {
+                exp: now + 7_200,
+                ..canonical_python_claim(now)
+            },
+            nbf: now + 3_600,
+        };
+        assert_refused(&verifier(), &hs256_token(&future, b"test-only-secret"));
+        assert_refused(&dual_material_verifier(false), &es256_token(&future));
+    }
+
+    #[test]
+    fn token_without_expiry_is_refused() {
+        #[derive(Serialize)]
+        struct Eternal {
+            sub: &'static str,
+            tenant_id: &'static str,
+            permissions: Vec<&'static str>,
+            iss: &'static str,
+            aud: &'static str,
+            iat: u64,
+            jti: &'static str,
+            #[serde(rename = "type")]
+            token_type: &'static str,
+        }
+        let claim = Eternal {
+            sub: "flight-service",
+            tenant_id: "system",
+            permissions: vec!["flight:invoke"],
+            iss: "dataplane",
+            aud: "dataplane",
+            iat: unix_now(),
+            jti: "eternal-jti",
+            token_type: "access",
+        };
+        assert_refused(&verifier(), &hs256_token(&claim, b"test-only-secret"));
+    }
+
+    #[test]
+    fn hostile_kid_and_jku_headers_never_select_another_key() {
+        let claim = canonical_python_claim(unix_now());
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("../../../../dev/null".to_owned());
+        header.jku = Some("https://attacker.invalid/jwks.json".to_owned());
+        // Signed with a key the attacker controls: refused, whatever the
+        // headers point at.
+        let forged = encode(&header, &claim, &EncodingKey::from_secret(b"attacker-key")).unwrap();
+        assert_refused(&dual_material_verifier(true), &forged);
+        // Signed with the configured secret: the headers are inert.
+        let genuine = encode(
+            &header,
+            &claim,
+            &EncodingKey::from_secret(WORKLOAD_SECRET.as_bytes()),
+        )
+        .unwrap();
+        dual_material_verifier(true)
+            .verify_metadata(&bearer_metadata(&genuine))
+            .unwrap();
+    }
+
+    #[test]
+    fn outbound_authorization_cannot_inject_a_second_header() {
+        for hostile in [
+            "Bearer token\r\nx-injected: 1",
+            "Bearer token\nauthorization: Bearer other",
+            "Bearer tok\0en",
+        ] {
+            let error = FlightAuthorizationMetadata::from_values(Some(hostile), None).unwrap_err();
+            assert!(matches!(error, AuthError::InvalidClientAuthorization));
+            let error = FlightAuthorizationMetadata::from_values(None, Some(hostile)).unwrap_err();
+            assert!(matches!(error, AuthError::InvalidClientAuthorization));
         }
     }
 
