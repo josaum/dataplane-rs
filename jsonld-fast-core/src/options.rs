@@ -76,12 +76,14 @@ pub(crate) const FRAME_WORKER_BASE_STACK: usize = 1024 * 1024;
 /// Output bytes allowed per byte of input when no explicit
 /// [`JsonLdLimits::max_output_bytes`] is set: 16.
 ///
-/// Expansion turns short terms into full IRIs and wraps every value in an
-/// object, so legitimate output is a small multiple of the input; the
-/// W3C fixtures and the benchmark documents stay below 8 (measured as
-/// charged bytes over the estimated input size). 16 doubles that margin.
-/// A term mapped to a 1 MiB IRI and used 128 times is 128 times its input
-/// and is refused.
+/// Only produced strings are charged (keys, IRIs, values), not
+/// punctuation, so legitimate output is about the size of the input or a
+/// small multiple of it when short terms become long IRIs. Measured: the
+/// 26 W3C fixtures that expand need at most 0.8 charged bytes per byte of
+/// input text, and the benchmark documents (up to 1,024 nodes) fit inside
+/// [`OUTPUT_BYTES_FLOOR`] alone. 16 leaves a wide margin for documents
+/// built from very short terms. A term mapped to a 1 MiB IRI and used 128
+/// times is 128 times its input and is refused.
 pub const OUTPUT_BYTES_PER_INPUT_BYTE: usize = 16;
 
 /// Output bytes always allowed regardless of input size: 16 MiB.
