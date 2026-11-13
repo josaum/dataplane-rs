@@ -121,7 +121,31 @@
 //! - context processing recurses on a scoped context and on a prefix
 //!   chain, neither of which is document nesting — a prefix chain is flat
 //!   JSON — so both are bounded by [`MAX_CONTEXT_RECURSION`] and refused
-//!   with [`JsonLdResource::ContextRecursion`].
+//!   with [`JsonLdResource::ContextRecursion`];
+//! - framing embeds referenced nodes inside their referrers, so a flat
+//!   chain of N nodes frames N levels deep: embedding is bounded by
+//!   [`MAX_FRAME_EMBED_DEPTH`] ([`JsonLdResource::EmbedDepth`]) and every
+//!   embedded copy is charged to [`JsonLdLimits::max_nodes`], which stops
+//!   `@embed: @always` from multiplying a shared node exponentially.
+//!
+//! Every caller-built [`serde_json::Value`] (document, frame, compaction
+//! context) is measured against [`JsonLdLimits::max_depth`] with an
+//! explicit heap stack before any recursive code — including `clone` —
+//! touches it, so a value nested 100,000 levels deep is refused instead of
+//! overflowing the native stack. Native stack use per level is large in
+//! unoptimized builds (about 17 KiB per object level in expansion), so a
+//! document *within* the limit but deeper than a few levels is processed
+//! on a short-lived worker thread whose stack is sized from its measured
+//! depth; shallow documents run inline. Processing a legal document
+//! therefore does not depend on the caller's stack size. Two things still
+//! do, and are the caller's concern: a framed result can nest about three
+//! times its embed depth (up to about 3 × [`MAX_FRAME_EMBED_DEPTH`]
+//! levels), so expanding it again needs a `max_depth` above that; and
+//! dropping (or cloning, or comparing) a very deep returned
+//! [`serde_json::Value`] recurses on the caller's own stack, which in an
+//! unoptimized build overflows a small thread long before 6,000 levels.
+//! Where threads cannot be started (for example `wasm32`), input that needs
+//! a worker is refused with [`JsonLdError::WorkerUnavailable`].
 //!
 //! # Deliberate deviations (all fail closed)
 //!
@@ -175,6 +199,7 @@ mod error;
 mod expand;
 mod frame;
 mod from_rdf;
+mod guard;
 mod iri;
 mod json_canon;
 mod node_map;
@@ -190,7 +215,7 @@ use serde_json::Value;
 pub use error::{JsonLdError, JsonLdFeature, JsonLdResource};
 pub use options::{
     DEFAULT_MAX_DEPTH, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_NODES, JsonLdLimits, JsonLdOptions,
-    MAX_CONTEXT_RECURSION,
+    MAX_CONTEXT_RECURSION, MAX_FRAME_EMBED_DEPTH,
 };
 pub use streaming::{
     ExpandStreamingGraph, STREAMING_PROFILE, StreamingGraphNodes, compact_streaming,
@@ -226,8 +251,12 @@ pub fn parse_document(text: &str, limits: &JsonLdLimits) -> Result<Value, JsonLd
 ///
 /// Returns the typed [`JsonLdError`] raised by context processing, refused
 /// features, malformed documents, or an exceeded resource limit.
+///
+/// Input nested deeper than a few levels runs on a short-lived worker
+/// thread; [`JsonLdError::WorkerUnavailable`] when it cannot be started.
 pub fn expand(document: &Value, options: &JsonLdOptions) -> Result<Value, JsonLdError> {
-    expand::expand_document(document, options)
+    let depth = guard::check_nesting(document, options.limits.max_depth)?;
+    guard::run_sized(depth, || expand::expand_document(document, options))
 }
 
 /// Compacts a JSON-LD document against an inline context
@@ -248,18 +277,30 @@ pub fn expand(document: &Value, options: &JsonLdOptions) -> Result<Value, JsonLd
 /// `context` (including [`JsonLdError::RemoteContextRefused`]), and
 /// [`JsonLdError::InvalidTerm`] for the API's `IRI confused with prefix`
 /// condition.
+///
+/// Input nested deeper than a few levels runs on a short-lived worker
+/// thread; [`JsonLdError::WorkerUnavailable`] when it cannot be started.
 pub fn compact(
     document: &Value,
     context: &Value,
     options: &JsonLdOptions,
 ) -> Result<Value, JsonLdError> {
-    let expanded = expand::expand_document(document, options)?;
-    let context_value = match context {
-        Value::Object(map) if map.contains_key("@context") => map["@context"].clone(),
-        other => other.clone(),
-    };
-    let compacted = compact::compact_expanded(&expanded, &context_value, options)?;
-    Ok(compact::attach_context(compacted, &context_value))
+    // The context is caller-built and is cloned below; `Clone` recurses, so
+    // its nesting is bounded before anything touches it.
+    let context_depth = guard::check_nesting(context, options.limits.max_depth)?;
+    let document_depth = guard::check_nesting(document, options.limits.max_depth)?;
+    guard::run_sized(context_depth.max(document_depth), || {
+        let expanded = expand::expand_document(document, options)?;
+        let context_value = match context {
+            Value::Object(map) => map
+                .get("@context")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(map.clone())),
+            other => other.clone(),
+        };
+        let compacted = compact::compact_expanded(&expanded, &context_value, options)?;
+        Ok(compact::attach_context(compacted, &context_value))
+    })
 }
 
 /// Frames `document` with `frame` (JSON-LD 1.1 Framing REC section 4.1).
@@ -273,19 +314,36 @@ pub fn compact(
 /// over the default graph; a string frame or a remote frame context is
 /// refused.
 ///
+/// Embedding is bounded by [`MAX_FRAME_EMBED_DEPTH`]. A framing that embeds
+/// more than a few levels deep is re-run from the start on a short-lived
+/// worker thread whose stack is sized for that bound, so the caller's
+/// stack does not limit framing itself. The returned value, however, can
+/// nest about three JSON levels per embed level: re-expanding it needs a
+/// [`JsonLdLimits::max_depth`] above that, and dropping a very deep result
+/// recurses on the caller's stack, which is the caller's concern in an
+/// unoptimized build. `@embed: @always` fan-out is charged against
+/// [`JsonLdLimits::max_nodes`] by design.
+///
 /// # Errors
 ///
 /// Returns [`JsonLdError::InvalidFrame`] and
 /// [`JsonLdError::InvalidEmbedValue`] for frame grammar violations,
 /// [`JsonLdError::RemoteContextRefused`] for
-/// remote frame contexts, and every expansion and compaction error of the
-/// document and the frame.
+/// remote frame contexts, [`JsonLdError::ResourceLimit`] with
+/// [`JsonLdResource::EmbedDepth`] or [`JsonLdResource::Nodes`] when
+/// embedding exceeds its bounds, [`JsonLdError::WorkerUnavailable`] when a
+/// deep framing needs a worker thread that cannot be started, and every
+/// expansion and compaction error of the document and the frame.
 pub fn frame(
     document: &Value,
     frame: &Value,
     options: &JsonLdOptions,
 ) -> Result<Value, JsonLdError> {
-    frame::frame_document(document, frame, options)
+    let frame_depth = guard::check_nesting(frame, options.limits.max_depth)?;
+    let document_depth = guard::check_nesting(document, options.limits.max_depth)?;
+    guard::run_sized(frame_depth.max(document_depth), || {
+        frame::frame_document(document, frame, options)
+    })
 }
 
 /// Deserializes a JSON-LD document to `UnsignedQuadStream` batches.
@@ -301,13 +359,19 @@ pub fn frame(
 /// Returns expansion errors, [`JsonLdError::RelativeIri`] for IRIs that
 /// stayed relative, [`JsonLdError::InvalidTerm`] for unrepresentable terms,
 /// and [`JsonLdError::Quad`] when a quad-batch budget is exceeded.
+///
+/// Input nested deeper than a few levels runs on a short-lived worker
+/// thread; [`JsonLdError::WorkerUnavailable`] when it cannot be started.
 pub fn to_quads(
     document: &Value,
     options: &JsonLdOptions,
     provenance: Option<&SourceProvenance>,
 ) -> Result<Vec<RecordBatch>, JsonLdError> {
-    let expanded = expand::expand_document(document, options)?;
-    let quads = to_rdf::expanded_to_quads(&expanded)?;
+    let depth = guard::check_nesting(document, options.limits.max_depth)?;
+    let quads = guard::run_sized(depth, || {
+        let expanded = expand::expand_document(document, options)?;
+        to_rdf::expanded_to_quads(&expanded)
+    })?;
     let mut builder = QuadBatchBuilder::new(options.quad_limits);
     for quad in &quads {
         builder.push(quad.as_ref(), provenance)?;
@@ -325,7 +389,28 @@ pub fn to_quads(
 /// # Errors
 ///
 /// Returns [`JsonLdError::Quad`] when a batch fails contract validation or
-/// a row does not decode to a valid quad.
+/// a row does not decode to a valid quad, and [`JsonLdError::ResourceLimit`]
+/// when lists nest deeper than [`DEFAULT_MAX_DEPTH`] or repeated copies of
+/// shared lists exceed [`DEFAULT_MAX_NODES`] values; use
+/// [`from_quads_with_limits`] to raise them.
 pub fn from_quads(batches: &[RecordBatch]) -> Result<Value, JsonLdError> {
-    from_rdf::quads_to_expanded(batches)
+    from_rdf::quads_to_expanded(batches, &JsonLdLimits::default())
+}
+
+/// [`from_quads`] with caller-chosen list budgets.
+///
+/// Well-formed `rdf:first`/`rdf:rest` chains become `@list` arrays. Lists
+/// may nest at most [`JsonLdLimits::max_depth`] deep, and copies made
+/// because one list is referenced from several places may total at most
+/// [`JsonLdLimits::max_nodes`] values (the first use of each list is not
+/// charged). [`from_quads`] uses [`JsonLdLimits::default`].
+///
+/// # Errors
+///
+/// The errors of [`from_quads`], with the limits taken from `limits`.
+pub fn from_quads_with_limits(
+    batches: &[RecordBatch],
+    limits: &JsonLdLimits,
+) -> Result<Value, JsonLdError> {
+    from_rdf::quads_to_expanded(batches, limits)
 }

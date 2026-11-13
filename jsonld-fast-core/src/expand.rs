@@ -65,6 +65,9 @@ fn expand_with_mode(
     options: &JsonLdOptions,
     frame_expansion: bool,
 ) -> Result<Value, JsonLdError> {
+    // Nesting is bounded by the caller: every public entry point that
+    // reaches here (`expand`, `compact`, `to_quads`, `frame`) has already
+    // run `guard::check_nesting` on this value and sized its stack.
     let mut ctx = Context {
         base: options.base.clone(),
         ..Context::default()

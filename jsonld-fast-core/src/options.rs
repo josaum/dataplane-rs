@@ -46,6 +46,30 @@ pub const DEFAULT_MAX_DEPTH: usize = 128;
 /// build runs out of stack.
 pub const MAX_CONTEXT_RECURSION: usize = 32;
 
+/// Maximum nesting of embedded nodes in one framing run: 2,048.
+///
+/// Framing embeds a referenced node inside the node that references it, so
+/// a flat `@graph` of chained nodes frames as deep as the chain is long; no
+/// document-nesting budget sees that. Deeper embedding is refused with
+/// [`crate::JsonLdError::ResourceLimit`] and
+/// [`crate::JsonLdResource::EmbedDepth`]. 2,048 keeps a ring of a thousand
+/// `@once`-embedded nodes (the framing benchmark) working while bounding
+/// the worker stack below. Like [`MAX_CONTEXT_RECURSION`] it is a constant,
+/// not a caller-tunable limit, because it sizes native stack.
+pub const MAX_FRAME_EMBED_DEPTH: usize = 2_048;
+
+/// Native stack reserved per embed level on the framing worker: 128 KiB.
+///
+/// Framing plus the compaction of its output measured about 25 KiB per
+/// embed level in an unoptimized build; 128 KiB leaves a five-fold margin.
+/// The worker reserves [`MAX_FRAME_EMBED_DEPTH`] times this plus
+/// [`FRAME_WORKER_BASE_STACK`] (about 257 MiB of address space, committed
+/// only as the recursion actually touches it).
+pub(crate) const FRAME_STACK_PER_EMBED_LEVEL: usize = 128 * 1024;
+
+/// Fixed native stack of the framing worker, for the non-recursive frames.
+pub(crate) const FRAME_WORKER_BASE_STACK: usize = 1024 * 1024;
+
 /// Fail-closed limits for one JSON-LD processing run.
 #[derive(Clone, Copy, Debug)]
 pub struct JsonLdLimits {

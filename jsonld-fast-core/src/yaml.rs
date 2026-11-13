@@ -27,12 +27,19 @@
 //! by the existing expand / compact / flatten / toRdf algorithms. Remote
 //! contexts stay refused.
 
+use std::collections::HashMap;
+
 use saphyr::{LoadableYamlNode, Scalar, Yaml};
 use saphyr_parser::{Event, Parser, Tag};
 use serde_json::{Map, Number, Value};
 
 use crate::{
-    compact, error::JsonLdError, expand, iri::is_absolute_iri, options::JsonLdOptions, to_quads,
+    compact,
+    error::{JsonLdError, JsonLdResource},
+    expand,
+    iri::is_absolute_iri,
+    options::{JsonLdLimits, JsonLdOptions},
+    to_quads,
 };
 
 use arrow_array::RecordBatch;
@@ -79,7 +86,12 @@ pub struct YamlLdOptions {
 /// # Errors
 ///
 /// Byte-budget errors, YAML composition errors, mapping-key / profile /
-/// load failures, and inf/nan refusals.
+/// load failures, and inf/nan refusals. [`JsonLdError::ResourceLimit`]
+/// with [`JsonLdResource::Depth`] when collections nest deeper than
+/// [`JsonLdLimits::max_depth`], and with [`JsonLdResource::Nodes`] when the
+/// composed stream — every alias counted as a full copy of its anchor —
+/// would exceed [`JsonLdLimits::max_nodes`]; both are checked on the event
+/// stream before anything is composed.
 pub fn parse_yaml_ld(text: &str, options: &YamlLdOptions) -> Result<Value, JsonLdError> {
     parse_yaml_ld_bytes(text.as_bytes(), options)
 }
@@ -110,9 +122,7 @@ pub fn parse_yaml_ld_bytes(bytes: &[u8], options: &YamlLdOptions) -> Result<Valu
             observed: text.len(),
         });
     }
-    if options.profile == YamlLdProfile::Basic {
-        refuse_alias_events(text)?;
-    }
+    prescan_events(text, options.profile, &options.jsonld.limits)?;
     let docs = Yaml::load_from_str(text)
         .map_err(|error| JsonLdError::YamlLoadFailed(format!("YAML parse failed: {error}")))?;
     if docs.is_empty() {
@@ -141,8 +151,12 @@ pub fn parse_yaml_ld_bytes(bytes: &[u8], options: &YamlLdOptions) -> Result<Valu
 ///
 /// # Errors
 ///
-/// [`JsonLdError::YamlLoadFailed`] when a number cannot be written as YAML.
+/// [`JsonLdError::YamlLoadFailed`] when a number cannot be written as YAML,
+/// and [`JsonLdError::ResourceLimit`] with [`crate::JsonLdResource::Depth`]
+/// when `document` nests deeper than [`crate::DEFAULT_MAX_DEPTH`] (the
+/// writer recurses once per level, so the bound is checked first).
 pub fn to_yaml_ld(document: &Value) -> Result<String, JsonLdError> {
+    crate::guard::check_nesting(document, crate::DEFAULT_MAX_DEPTH)?;
     let mut out = String::new();
     write_yaml(&mut out, document, 0)?;
     if !out.ends_with('\n') {
@@ -189,21 +203,138 @@ pub fn to_quads_yaml_ld(
     to_quads(&document, &options.jsonld, provenance)
 }
 
-/// YAML-LD Basic forbids alias nodes (`*name`). saphyr composes aliases
-/// into copies, so the composed graph no longer contains `Yaml::Alias`;
-/// the parser event stream is the only place the profile can still fail
-/// closed on the serialization that the spec forbids.
-fn refuse_alias_events(text: &str) -> Result<(), JsonLdError> {
+/// Scans the YAML event stream before saphyr composes it.
+///
+/// Composition is where YAML input amplifies, and the composed tree is
+/// where it recurses (saphyr deep-copies an anchor for every alias, and the
+/// tree is converted and dropped recursively), so both are bounded here on
+/// the flat event stream, before any tree exists:
+///
+/// - YAML-LD Basic forbids alias nodes (`*name`). saphyr composes aliases
+///   into copies, so the composed graph no longer contains `Yaml::Alias`;
+///   the event stream is the only place the profile can fail closed.
+/// - Nodes are counted the way expansion counts JSON values: every
+///   sequence, mapping, and value, but not a scalar mapping key. An alias
+///   counts as the composed size of its anchor, so ten anchors that each
+///   alias the previous one ten times ("billion laughs") are refused
+///   against [`JsonLdLimits::max_nodes`] long before 10^10 nodes exist.
+/// - Collection nesting is held to [`JsonLdLimits::max_depth`]. An alias
+///   nests its anchor's whole height where it appears, so a chain of
+///   anchors that each wrap the previous one in 120 flow levels is refused
+///   by its composed depth, not its textual depth.
+fn prescan_events(
+    text: &str,
+    profile: YamlLdProfile,
+    limits: &JsonLdLimits,
+) -> Result<(), JsonLdError> {
+    let mut open: Vec<OpenCollection> = Vec::new();
+    // Composed (node count, collection height) of each anchor, by id.
+    let mut anchored: HashMap<usize, (usize, usize)> = HashMap::new();
+    let mut composed: usize = 0;
     for event in Parser::new_from_str(text) {
         let (event, _) = event
             .map_err(|error| JsonLdError::YamlLoadFailed(format!("YAML parse failed: {error}")))?;
-        if matches!(event, Event::Alias(_)) {
-            return Err(JsonLdError::YamlProfile(
-                "YAML-LD Basic profile forbids alias nodes".to_owned(),
-            ));
+        match event {
+            Event::Alias(id) => {
+                if profile == YamlLdProfile::Basic {
+                    return Err(JsonLdError::YamlProfile(
+                        "YAML-LD Basic profile forbids alias nodes".to_owned(),
+                    ));
+                }
+                let (size, height) = anchored.get(&id).copied().unwrap_or((1, 0));
+                let depth = open.len().saturating_add(height);
+                if depth > limits.max_depth {
+                    return Err(JsonLdError::ResourceLimit {
+                        resource: JsonLdResource::Depth,
+                        limit: limits.max_depth,
+                        observed: depth,
+                    });
+                }
+                composed = composed.saturating_add(size);
+                complete_child(&mut open, height);
+            }
+            Event::Scalar(_, _, anchor, _) => {
+                if !is_mapping_key(&open) {
+                    composed = composed.saturating_add(1);
+                }
+                if anchor != 0 {
+                    anchored.insert(anchor, (1, 0));
+                }
+                complete_child(&mut open, 0);
+            }
+            Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
+                composed = composed.saturating_add(1);
+                open.push(OpenCollection {
+                    anchor,
+                    opened: composed,
+                    mapping: matches!(event, Event::MappingStart(..)),
+                    expect_key: true,
+                    child_height: 0,
+                });
+                if open.len() > limits.max_depth {
+                    return Err(JsonLdError::ResourceLimit {
+                        resource: JsonLdResource::Depth,
+                        limit: limits.max_depth,
+                        observed: open.len(),
+                    });
+                }
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                if let Some(closed) = open.pop() {
+                    let height = closed.child_height.saturating_add(1);
+                    if closed.anchor != 0 {
+                        let size = composed.saturating_sub(closed.opened).saturating_add(1);
+                        anchored.insert(closed.anchor, (size, height));
+                    }
+                    complete_child(&mut open, height);
+                }
+            }
+            Event::Nothing
+            | Event::StreamStart
+            | Event::StreamEnd
+            | Event::DocumentStart(_)
+            | Event::DocumentEnd => {}
+        }
+        if composed > limits.max_nodes {
+            return Err(JsonLdError::ResourceLimit {
+                resource: JsonLdResource::Nodes,
+                limit: limits.max_nodes,
+                observed: composed,
+            });
         }
     }
     Ok(())
+}
+
+/// A collection still open in [`prescan_events`].
+#[derive(Debug)]
+struct OpenCollection {
+    /// Anchor id (0 when unanchored).
+    anchor: usize,
+    /// Composed count when it opened, itself included.
+    opened: usize,
+    /// `true` for a mapping, whose children alternate key and value.
+    mapping: bool,
+    /// For a mapping: the next child is a key.
+    expect_key: bool,
+    /// Largest collection height among its completed children.
+    child_height: usize,
+}
+
+/// `true` when the next node is a key of the innermost open mapping.
+fn is_mapping_key(open: &[OpenCollection]) -> bool {
+    open.last()
+        .is_some_and(|parent| parent.mapping && parent.expect_key)
+}
+
+/// Records a completed child of `height` in the innermost open collection.
+fn complete_child(open: &mut [OpenCollection], height: usize) {
+    if let Some(parent) = open.last_mut() {
+        parent.child_height = parent.child_height.max(height);
+        if parent.mapping {
+            parent.expect_key = !parent.expect_key;
+        }
+    }
 }
 
 fn yaml_to_json(

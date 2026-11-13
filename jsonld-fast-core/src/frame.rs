@@ -33,11 +33,24 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Map, Value};
 
 use crate::{
-    error::JsonLdError,
+    error::{JsonLdError, JsonLdResource},
     expand,
     node_map::{DEFAULT_GRAPH, Graph, GraphMap, build_node_map},
-    options::JsonLdOptions,
+    options::{
+        FRAME_STACK_PER_EMBED_LEVEL, FRAME_WORKER_BASE_STACK, JsonLdOptions, MAX_FRAME_EMBED_DEPTH,
+    },
 };
+
+/// Embed depth framed on the caller's own thread before escalating.
+///
+/// Framing and the compaction of its output recurse once per embed level.
+/// A shallow framing (the common case) runs inline at no extra cost; one
+/// that embeds deeper is re-run on a worker thread whose stack is sized
+/// for [`MAX_FRAME_EMBED_DEPTH`]. The threshold keeps the inline run within
+/// a 256 KiB caller stack: unoptimized builds use about 25 KiB of native
+/// stack per embed level (measured), optimized builds a small fraction of
+/// that.
+const INLINE_EMBED_DEPTH: usize = if cfg!(debug_assertions) { 4 } else { 24 };
 
 /// Frames `document` with `frame` (JSON-LD 1.1 Framing section 4.1).
 ///
@@ -82,27 +95,128 @@ pub(crate) fn frame_document(
         .get(DEFAULT_GRAPH)
         .map(|graph| graph.keys().cloned().collect())
         .unwrap_or_default();
-    let mut state = FramingState {
-        graphs: &graphs,
-        current_graph: DEFAULT_GRAPH.to_owned(),
-        unique_embeds: HashMap::new(),
-        subject_stack: Vec::new(),
-        embed: Embed::Once,
-        explicit: false,
-        require_all: false,
-        omit_default: false,
-    };
-    let mut results = Vec::new();
-    frame_subjects(&mut state, &subjects, &frame_object, &mut results)?;
-    prune_blank_node_identifiers(&mut results);
-
-    // Compact the framed output with the frame's own context, wrap per
-    // omitGraph, clean up @preserve/@null, then attach the context.
     let context_value = frame_map.get("@context").cloned().unwrap_or(Value::Null);
-    let compacted =
-        crate::compact::compact_expanded(&Value::Array(results), &context_value, options)?;
-    let cleaned = cleanup_preserved(compacted);
-    Ok(crate::compact::attach_context(cleaned, &context_value))
+    let run = FramingRun {
+        graphs: &graphs,
+        subjects: &subjects,
+        frame: &frame_object,
+        context_value: &context_value,
+        options,
+    };
+
+    // Embedding follows references in the node map, not document nesting:
+    // a flat `@graph` of N chained nodes embeds N levels deep. Try the
+    // shallow case inline, and re-run a deeper one on a sized worker stack.
+    match run.execute(INLINE_EMBED_DEPTH) {
+        Err(FrameAbort::TooDeepForInline) => run_on_worker(&run),
+        Err(FrameAbort::Failed(error)) => Err(error),
+        Ok(framed) => Ok(framed),
+    }
+}
+
+/// Inputs of one framing run (everything after expansion and the node map).
+#[derive(Debug)]
+struct FramingRun<'run> {
+    graphs: &'run GraphMap,
+    subjects: &'run [String],
+    frame: &'run Map<String, Value>,
+    context_value: &'run Value,
+    options: &'run JsonLdOptions,
+}
+
+/// Why a framing run stopped.
+#[derive(Debug)]
+enum FrameAbort {
+    /// The inline embed-depth threshold was reached; re-run on a worker.
+    TooDeepForInline,
+    /// A real framing, budget, or compaction error.
+    Failed(JsonLdError),
+}
+
+impl FramingRun<'_> {
+    /// Frames, prunes, and compacts with embedding capped at `embed_cap`.
+    fn execute(&self, embed_cap: usize) -> Result<Value, FrameAbort> {
+        let max_embed_depth = embed_cap.min(MAX_FRAME_EMBED_DEPTH);
+        let mut state = FramingState {
+            graphs: self.graphs,
+            current_graph: DEFAULT_GRAPH.to_owned(),
+            unique_embeds: HashMap::new(),
+            subject_stack: Vec::new(),
+            embed: Embed::Once,
+            explicit: false,
+            require_all: false,
+            omit_default: false,
+            max_embed_depth,
+            embedded_values: 0,
+            max_embedded_values: self.options.limits.max_nodes,
+        };
+        let mut results = Vec::new();
+        if let Err(error) = frame_subjects(&mut state, self.subjects, self.frame, &mut results) {
+            let inline_cap_hit = max_embed_depth < MAX_FRAME_EMBED_DEPTH
+                && matches!(
+                    error,
+                    JsonLdError::ResourceLimit {
+                        resource: JsonLdResource::EmbedDepth,
+                        ..
+                    }
+                );
+            return Err(if inline_cap_hit {
+                FrameAbort::TooDeepForInline
+            } else {
+                FrameAbort::Failed(error)
+            });
+        }
+        prune_blank_node_identifiers(&mut results);
+
+        // Compact the framed output with the frame's own context, wrap per
+        // omitGraph, clean up @preserve/@null, then attach the context.
+        let compacted = crate::compact::compact_expanded(
+            &Value::Array(results),
+            self.context_value,
+            self.options,
+        )
+        .map_err(FrameAbort::Failed)?;
+        let cleaned = cleanup_preserved(compacted);
+        Ok(crate::compact::attach_context(cleaned, self.context_value))
+    }
+}
+
+/// Re-runs `run` on a worker thread whose stack fits
+/// [`MAX_FRAME_EMBED_DEPTH`] embed levels.
+///
+/// Partial results are built and dropped on the worker, so the caller's
+/// stack never holds more than the inline threshold of embed recursion.
+fn run_on_worker(run: &FramingRun<'_>) -> Result<Value, JsonLdError> {
+    let stack_bytes = MAX_FRAME_EMBED_DEPTH
+        .saturating_mul(FRAME_STACK_PER_EMBED_LEVEL)
+        .saturating_add(FRAME_WORKER_BASE_STACK);
+    std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .name("jsonld-frame".to_owned())
+            .stack_size(stack_bytes)
+            .spawn_scoped(scope, || run.execute(MAX_FRAME_EMBED_DEPTH));
+        let Ok(handle) = spawned else {
+            // No worker stack: refuse rather than recurse on a caller
+            // stack that was never sized for this embed depth.
+            return Err(JsonLdError::WorkerUnavailable {
+                stack_bytes,
+                depth: INLINE_EMBED_DEPTH.saturating_add(1),
+            });
+        };
+        match handle.join() {
+            Ok(Ok(framed)) => Ok(framed),
+            Ok(Err(FrameAbort::Failed(error))) => Err(error),
+            // Unreachable: the worker runs at the full cap, so a depth
+            // refusal there is `Failed`. Fail closed regardless.
+            Ok(Err(FrameAbort::TooDeepForInline)) => Err(JsonLdError::ResourceLimit {
+                resource: JsonLdResource::EmbedDepth,
+                limit: MAX_FRAME_EMBED_DEPTH,
+                observed: MAX_FRAME_EMBED_DEPTH.saturating_add(1),
+            }),
+            // A panic on the worker is a bug; propagate it unchanged.
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
 }
 
 /// Validates the expanded frame (the Framing spec's `invalid frame` error).
@@ -216,6 +330,12 @@ struct FramingState<'graphs> {
     require_all: bool,
     /// The inherited `@omitDefault` flag.
     omit_default: bool,
+    /// Embed nesting allowed in this run (see [`MAX_FRAME_EMBED_DEPTH`]).
+    max_embed_depth: usize,
+    /// Node values copied into the output so far.
+    embedded_values: usize,
+    /// Budget for `embedded_values` ([`crate::JsonLdLimits::max_nodes`]).
+    max_embedded_values: usize,
 }
 
 /// Reads a boolean framing flag from `frame`, with the spec default.
@@ -334,6 +454,7 @@ fn frame_subjects_inner(
             output.push(node_reference(id));
             continue;
         }
+        charge_embed(state, &node)?;
         state.subject_stack.push((graph.clone(), id.clone()));
         let mut out: Map<String, Value> = Map::new();
         out.insert("@id".to_owned(), Value::String(id.clone()));
@@ -481,6 +602,42 @@ fn frame_subjects_inner(
 
         state.subject_stack.pop();
         output.push(Value::Object(out));
+    }
+    Ok(())
+}
+
+/// Charges one embedding of `node` to the framing budgets.
+///
+/// `@embed: @always` copies a node every time it is referenced, so a DAG
+/// whose nodes each reference the next one twice frames to an output
+/// exponential in its size. Every embedded node is charged its value count
+/// against [`crate::JsonLdLimits::max_nodes`], and embed nesting against
+/// the run's cap, before the copy is made. This is an intended limit:
+/// legitimate `@always` fan-out that copies more than `max_nodes` values in
+/// total is refused too; raise `max_nodes` to frame it.
+fn charge_embed(
+    state: &mut FramingState<'_>,
+    node: &Map<String, Value>,
+) -> Result<(), JsonLdError> {
+    let depth = state.subject_stack.len().saturating_add(1);
+    if depth > state.max_embed_depth {
+        return Err(JsonLdError::ResourceLimit {
+            resource: JsonLdResource::EmbedDepth,
+            limit: state.max_embed_depth,
+            observed: depth,
+        });
+    }
+    let values = node
+        .values()
+        .map(|values| values.as_array().map_or(1, Vec::len))
+        .fold(1_usize, usize::saturating_add);
+    state.embedded_values = state.embedded_values.saturating_add(values);
+    if state.embedded_values > state.max_embedded_values {
+        return Err(JsonLdError::ResourceLimit {
+            resource: JsonLdResource::Nodes,
+            limit: state.max_embedded_values,
+            observed: state.embedded_values,
+        });
     }
     Ok(())
 }
