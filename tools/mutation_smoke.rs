@@ -263,12 +263,28 @@ pub fn run_on_small_stack<F>(body: F)
 where
     F: FnOnce() + Send + 'static,
 {
+    run_on_stack(SMALL_STACK_BYTES, body);
+}
+
+/// Runs `body` on a thread with exactly `stack_bytes` of stack.
+///
+/// For code whose recursion is bounded by a documented depth ceiling, size
+/// the stack from a measurement at that depth, not from a guess.
+///
+/// # Panics
+///
+/// Panics if the thread cannot be spawned or `body` panics. A stack
+/// overflow aborts the whole test binary.
+pub fn run_on_stack<F>(stack_bytes: usize, body: F)
+where
+    F: FnOnce() + Send + 'static,
+{
     std::thread::Builder::new()
-        .stack_size(SMALL_STACK_BYTES)
+        .stack_size(stack_bytes)
         .spawn(body)
-        .expect("spawn small-stack thread")
+        .expect("spawn sized-stack thread")
         .join()
-        .expect("decoder panicked on a small stack");
+        .expect("decoder panicked on a sized stack");
 }
 
 /// Feeds `iterations` mutated seeds to `decode` and returns every panic.

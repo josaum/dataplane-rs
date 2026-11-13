@@ -41,7 +41,30 @@ use crate::error::{CborldError, CborldResource};
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Default maximum nesting depth for CBOR items and JSON values.
+///
+/// Measured stack at this depth for the deepest documents `compress`
+/// accepts (macOS arm64): about 180 KiB unoptimized and 36 KiB optimized
+/// for `decompress`, about 116 KiB unoptimized for `compress`. Windows x64
+/// unoptimized frames run up to about twice as large, so a debug build on
+/// Windows needs roughly 370 KiB; run the codec on a thread with at least
+/// 512 KiB of stack in unoptimized builds.
 pub const DEFAULT_MAX_DEPTH: usize = 64;
+
+/// Hard ceiling on nesting depth, whatever [`CborLimits::max_depth`] says.
+///
+/// The CBOR reader is iterative, but the CBOR-LD codec layer recurses once
+/// per nesting level, so the depth budget is also a stack budget: a caller
+/// who set `max_depth` to `usize::MAX` could otherwise overflow any stack.
+/// Larger settings are clamped to this value (see
+/// [`CborLimits::effective_max_depth`]).
+///
+/// Measured stack at this depth (macOS arm64): about 372 KiB unoptimized
+/// and 100 KiB optimized for `decompress`, 228 KiB unoptimized for
+/// `compress`. Assuming Windows x64 unoptimized frames up to twice as
+/// large, about 750 KiB: below the 1 MiB Windows main-thread stack and the
+/// 2 MiB default for threads Rust spawns. Raising the ceiling raises that
+/// requirement by roughly 6 KiB per level in a Windows debug build.
+pub const MAX_DEPTH_CEILING: usize = 128;
 
 /// Default maximum number of CBOR data items decoded from one payload.
 pub const DEFAULT_MAX_ITEMS: usize = 1_048_576;
@@ -72,7 +95,8 @@ pub const DEFAULT_MAX_BASE58_WORK: u64 = 64 * 6144 * 6144;
 pub struct CborLimits {
     /// Maximum encoded input size in bytes accepted by the decoder.
     pub max_input_bytes: usize,
-    /// Maximum nesting depth of CBOR items and JSON values.
+    /// Maximum nesting depth of CBOR items and JSON values; values above
+    /// [`MAX_DEPTH_CEILING`] are clamped to it.
     pub max_depth: usize,
     /// Maximum number of CBOR data items decoded from one payload.
     pub max_items: usize,
@@ -94,6 +118,19 @@ pub struct CborLimits {
     /// work, not output. Exceeding it is a typed
     /// [`CborldError::ResourceLimit`] for `base58_work`.
     pub max_base58_work: u64,
+}
+
+impl CborLimits {
+    /// Returns the nesting depth actually enforced: `max_depth` clamped to
+    /// [`MAX_DEPTH_CEILING`].
+    #[must_use]
+    pub const fn effective_max_depth(&self) -> usize {
+        if self.max_depth < MAX_DEPTH_CEILING {
+            self.max_depth
+        } else {
+            MAX_DEPTH_CEILING
+        }
+    }
 }
 
 impl Default for CborLimits {
@@ -167,8 +204,8 @@ fn encode_into(
     limits: &CborLimits,
     depth: usize,
 ) -> Result<(), CborldError> {
-    if depth > limits.max_depth {
-        return Err(depth_error(limits.max_depth, depth));
+    if depth > limits.effective_max_depth() {
+        return Err(depth_error(limits.effective_max_depth(), depth));
     }
     match value {
         CborValue::Unsigned(n) => write_head(out, 0, *n),
@@ -277,7 +314,7 @@ fn f64_to_half(value: f64) -> Option<u16> {
 /// # Errors
 ///
 /// Returns [`CborldError::ResourceLimit`] when nesting exceeds
-/// `limits.max_depth`, and [`CborldError::Encode`] when a map contains
+/// the effective depth ([`CborLimits::effective_max_depth`]), and [`CborldError::Encode`] when a map contains
 /// duplicate keys.
 pub fn encode_canonical(value: &CborValue, limits: &CborLimits) -> Result<Vec<u8>, CborldError> {
     let mut out = Vec::new();
@@ -436,8 +473,8 @@ impl<'bytes> Decoder<'bytes> {
         let mut stack: Vec<Frame> = Vec::new();
         loop {
             let depth = stack.len().saturating_add(1);
-            if depth > self.limits.max_depth {
-                return Err(depth_error(self.limits.max_depth, depth));
+            if depth > self.limits.effective_max_depth() {
+                return Err(depth_error(self.limits.effective_max_depth(), depth));
             }
             self.count_item()?;
             let mut value = match self.read_head()? {

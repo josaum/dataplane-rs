@@ -231,7 +231,7 @@ fn resolve_registry_entry(
 fn depth_error(limits: &CborLimits, observed: usize) -> CborldError {
     CborldError::ResourceLimit {
         resource: CborldResource::Depth,
-        limit: limits.max_depth,
+        limit: limits.effective_max_depth(),
         observed,
     }
 }
@@ -242,7 +242,7 @@ fn json_to_cbor(
     limits: &CborLimits,
     depth: usize,
 ) -> Result<CborValue, CborldError> {
-    if depth > limits.max_depth {
+    if depth > limits.effective_max_depth() {
         return Err(depth_error(limits, depth));
     }
     Ok(match value {
@@ -313,7 +313,7 @@ fn cbor_to_json(
     limits: &CborLimits,
     depth: usize,
 ) -> Result<Value, CborldError> {
-    if depth > limits.max_depth {
+    if depth > limits.effective_max_depth() {
         return Err(depth_error(limits, depth));
     }
     Ok(match value {
@@ -427,7 +427,7 @@ impl Compressor<'_> {
         active: &ActiveContext,
         depth: usize,
     ) -> Result<CborValue, CborldError> {
-        if depth > self.limits.max_depth {
+        if depth > self.limits.effective_max_depth() {
             return Err(depth_error(&self.limits, depth));
         }
         let mut entries: Vec<(CborValue, CborValue)> = Vec::with_capacity(object.len());
@@ -588,7 +588,7 @@ impl Compressor<'_> {
         value: &Value,
         depth: usize,
     ) -> Result<CborValue, CborldError> {
-        if depth > self.limits.max_depth {
+        if depth > self.limits.effective_max_depth() {
             return Err(depth_error(&self.limits, depth));
         }
         match value {
@@ -870,7 +870,7 @@ impl Decompressor<'_> {
         active: &ActiveContext,
         depth: usize,
     ) -> Result<serde_json::Map<String, Value>, CborldError> {
-        if depth > self.limits.max_depth {
+        if depth > self.limits.effective_max_depth() {
             return Err(depth_error(&self.limits, depth));
         }
         let mut output = serde_json::Map::new();
@@ -1104,7 +1104,7 @@ impl Decompressor<'_> {
         value: &CborValue,
         depth: usize,
     ) -> Result<Value, CborldError> {
-        if depth > self.limits.max_depth {
+        if depth > self.limits.effective_max_depth() {
             return Err(depth_error(&self.limits, depth));
         }
         if let CborValue::Map(entries) = value {

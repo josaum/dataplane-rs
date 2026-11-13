@@ -16,7 +16,7 @@ static ALLOCATOR: smoke::CappedAllocator = smoke::CappedAllocator;
 
 use cborld_fast_core::{
     CborldError, CborldOptions, ProvidedContexts,
-    cbor::{CborLimits, CborValue, decode, encode_canonical},
+    cbor::{CborLimits, CborValue, MAX_DEPTH_CEILING, decode, encode_canonical},
     decompress,
 };
 use serde_json::{Map, Value, json};
@@ -197,11 +197,27 @@ fn bignum_tags_are_refused_with_a_typed_error() {
     }
 }
 
-/// The deepest document `compress` accepts must decompress on a small stack.
+/// Stack for codec work at the default depth: 512 KiB.
+///
+/// Measured on macOS arm64 in an unoptimized build: the deepest documents
+/// `compress` accepts at depth 64 need about 180 KiB to decompress and
+/// 116 KiB to compress. Windows x64 debug frames run up to about twice as
+/// large (a 256 KiB thread overflowed there), so this is the measurement
+/// times two, rounded up with headroom.
+const DEFAULT_DEPTH_STACK_BYTES: usize = 512 * 1024;
+
+/// Stack for codec work at [`MAX_DEPTH_CEILING`]: 1 MiB.
+///
+/// Measured on macOS arm64 unoptimized: about 372 KiB to decompress the
+/// deepest node chain at depth 128; times two for Windows, rounded up.
+const CEILING_DEPTH_STACK_BYTES: usize = 1024 * 1024;
+
+/// The deepest document `compress` accepts must decompress on a stack
+/// sized from the measured requirement at the default depth.
 #[test]
 fn deepest_accepted_document_decompresses_on_a_small_stack() {
     let _serial = smoke::measure_alone();
-    smoke::run_on_small_stack(|| {
+    smoke::run_on_stack(DEFAULT_DEPTH_STACK_BYTES, || {
         let options = CborldOptions::default();
         // Nested nodes: the deepest chain the depth budget admits.
         let mut deepest = None;
@@ -541,4 +557,57 @@ fn base58_work_is_charged_for_multibase_and_did_segments() {
     );
     // Within budget, both decode.
     assert!(decompress(&bytes, &CborldOptions::default()).is_ok());
+}
+
+/// A caller who raises `max_depth` to `usize::MAX` gets the ceiling, not
+/// a stack overflow: the deepest documents at the ceiling round-trip on a
+/// stack sized for it, and anything deeper is a typed depth error that
+/// names the ceiling.
+#[test]
+fn max_depth_is_clamped_to_the_ceiling() {
+    let _serial = smoke::measure_alone();
+    smoke::run_on_stack(CEILING_DEPTH_STACK_BYTES, || {
+        let options = CborldOptions {
+            limits: CborLimits {
+                max_depth: usize::MAX,
+                ..CborLimits::default()
+            },
+            ..CborldOptions::default()
+        };
+        assert_eq!(options.limits.effective_max_depth(), MAX_DEPTH_CEILING);
+        let mut node = json!({"v": 1});
+        let mut deepest = None;
+        let mut refused = None;
+        for _ in 0..1_000 {
+            node = json!({"@context": {"n": "http://e/n"}, "n": node});
+            match cborld_fast_core::compress(&node, &options) {
+                Ok(bytes) => deepest = Some((node.clone(), bytes)),
+                Err(error) => {
+                    refused = Some(error);
+                    break;
+                }
+            }
+        }
+        assert!(
+            matches!(
+                refused,
+                Some(CborldError::ResourceLimit { limit, .. }) if limit == MAX_DEPTH_CEILING
+            ),
+            "{refused:?}"
+        );
+        let (document, bytes) = deepest.expect("some depth compresses");
+        assert_eq!(decompress(&bytes, &options).ok(), Some(document));
+        // 100,000 nested arrays through the reader and the codec.
+        let bytes = nested(&[0x81], &[0x00], 100_000);
+        let result = decode(&bytes, &options.limits);
+        assert!(
+            matches!(
+                result,
+                Err(CborldError::ResourceLimit { limit, .. }) if limit == MAX_DEPTH_CEILING
+            ),
+            "{result:?}"
+        );
+        let result = decompress(&bytes, &options);
+        assert!(is_resource(&result, "depth"), "{result:?}");
+    });
 }
