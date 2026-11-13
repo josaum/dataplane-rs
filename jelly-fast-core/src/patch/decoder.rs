@@ -17,15 +17,28 @@ use crate::{
     terms::{TermDecoder, blank_node},
 };
 
-/// Default most operations one patch frame may decode into: 1,024.
+/// Default most operations one patch frame may decode into: 8,192.
 ///
-/// Each statement run is its own Arrow batch, and an empty batch builder
-/// reserves about 130 KiB of capacity, so this bounds that overhead at
-/// roughly 130 MiB per frame however small its rows are; the quad limits
-/// bound the frame's content across all of its runs. A frame of more than 1,024
-/// alternating add/delete runs (which the default encoder, at up to 8,192
-/// rows per frame, can emit for update-heavy patches) needs a larger value.
-pub const DEFAULT_MAX_PATCH_OPS_PER_FRAME: usize = 1024;
+/// Equal to [`DEFAULT_PATCH_ROWS_PER_FRAME`](crate::DEFAULT_PATCH_ROWS_PER_FRAME),
+/// the most operation rows the default encoder puts in one frame, so the
+/// encoder's own output always decodes at default options. Each statement
+/// run is its own Arrow batch reserved for eight rows and grown on
+/// demand: a 4 KB frame of 1,001 one-row runs allocates about 18 MB in
+/// total (measured), against about 330 MB when every run reserved Arrow's
+/// default 1,024 rows. The frame-wide quad limits bound the content.
+pub const DEFAULT_MAX_PATCH_OPS_PER_FRAME: usize =
+    crate::patch::encoder::DEFAULT_PATCH_ROWS_PER_FRAME;
+
+/// Rows reserved up front for one statement run's batch builder.
+///
+/// A run's builder grows on demand, so this only sizes the first
+/// allocation. Arrow's default (1,024 rows, about 130 KiB per builder) made
+/// a 4 KB frame of alternating one-row runs reserve hundreds of MB.
+const RUN_BUILDER_CAPACITY: usize = 8;
+
+/// Message of the error every call returns after the decoder has failed.
+const POISONED: &str = "patch decoder failed on an earlier frame; its lookup table, repeated-term, \
+                        and transaction state are undefined, so it refuses every later frame";
 
 /// Fail-closed configuration for [`JellyPatchDecoder`].
 ///
@@ -121,6 +134,8 @@ struct PendingBatch {
 pub struct JellyPatchDecoder {
     options: JellyPatchDecoderOptions,
     state: Option<PatchState>,
+    /// Set by the first error; every later call fails closed.
+    failed: bool,
 }
 
 impl JellyPatchDecoder {
@@ -130,6 +145,7 @@ impl JellyPatchDecoder {
         Self {
             options,
             state: None,
+            failed: false,
         }
     }
 
@@ -152,7 +168,30 @@ impl JellyPatchDecoder {
     /// content or ordering (including transaction and header-placement
     /// violations); and [`JellyError::Quad`] when the frame's statements,
     /// summed across all runs, hit a quad limit.
+    ///
+    /// After any error the decoder is poisoned: frame state is mutated in
+    /// place without rollback, so this and [`Self::finish`] return
+    /// [`JellyError::Frame`] for every later call instead of decoding later
+    /// frames against half-applied tables.
     pub fn decode_frame(&mut self, frame: &RdfPatchFrame) -> Result<Vec<PatchOp>, JellyError> {
+        if self.failed {
+            return Err(JellyError::Frame(POISONED.into()));
+        }
+        let result = self.decode_frame_unchecked(frame);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// Decodes one frame, mutating stream state in place.
+    ///
+    /// State is not rolled back on error; [`Self::decode_frame`] poisons
+    /// the decoder instead.
+    fn decode_frame_unchecked(
+        &mut self,
+        frame: &RdfPatchFrame,
+    ) -> Result<Vec<PatchOp>, JellyError> {
         let mut ops = Vec::new();
         let mut pending: Option<PendingBatch> = None;
         let quad_limits = self.options.quad_limits;
@@ -184,7 +223,7 @@ impl JellyPatchDecoder {
                     }
                     let batch = pending.get_or_insert_with(|| PendingBatch {
                         is_add,
-                        builder: QuadBatchBuilder::new(quad_limits),
+                        builder: QuadBatchBuilder::with_capacity(quad_limits, RUN_BUILDER_CAPACITY),
                     });
                     batch.builder.push(quad.as_ref(), None)?;
                 }
@@ -282,9 +321,13 @@ impl JellyPatchDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`JellyError::Frame`] when a transaction is still open; a
-    /// truncated patch must never pass for a complete one.
+    /// Returns [`JellyError::Frame`] when a transaction is still open (a
+    /// truncated patch must never pass for a complete one) or when an
+    /// earlier [`Self::decode_frame`] call failed.
     pub fn finish(&self) -> Result<(), JellyError> {
+        if self.failed {
+            return Err(JellyError::Frame(POISONED.into()));
+        }
         if self
             .state
             .as_ref()

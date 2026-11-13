@@ -141,11 +141,17 @@ fn many_tiny_frames_redeclaring_tables_are_refused() {
     assert!(first.is_ok(), "{first:?}");
     let before = smoke::live_allocated();
     let mut peak = before;
-    for _ in 0..10_000 {
+    for attempt in 0..10_000 {
         let again = decoder.decode_frame(&frame(vec![row(rdf_stream_row::Row::Options(
             options.clone(),
         ))]));
-        assert!(matches!(again, Err(JellyError::Options(_))), "{again:?}");
+        // The first re-declaration is the options error; it poisons the
+        // decoder, so every later frame is refused as a whole.
+        if attempt == 0 {
+            assert!(matches!(again, Err(JellyError::Options(_))), "{again:?}");
+        } else {
+            assert!(matches!(again, Err(JellyError::Frame(_))), "{again:?}");
+        }
         peak = peak.max(smoke::live_allocated());
     }
     let grown = peak.saturating_sub(before);
@@ -432,4 +438,230 @@ fn retained_bytes_are_bounded_across_runs() {
         "{wire} wire bytes: {:?}",
         result.as_ref().map(Vec::len)
     );
+}
+
+fn one_quad_batch(index: usize) -> arrow_array::RecordBatch {
+    let subject = oxrdf::NamedNode::new(format!("http://e/s{}", index % 97)).expect("iri");
+    let predicate = oxrdf::NamedNode::new(format!("http://e/p{}", index % 13)).expect("iri");
+    let object = oxrdf::Literal::new_simple_literal(format!("v{index}"));
+    let mut builder =
+        quad_fast_core::QuadBatchBuilder::with_capacity(quad_fast_core::QuadLimits::default(), 1);
+    builder
+        .push(
+            oxrdf::QuadRef::new(
+                &subject,
+                &predicate,
+                &object,
+                oxrdf::GraphNameRef::DefaultGraph,
+            ),
+            None,
+        )
+        .expect("push");
+    builder.finish().expect("finish")
+}
+
+fn round_trip_at_defaults(ops: &[jelly_fast_core::PatchOp]) -> usize {
+    let mut encoder = jelly_fast_core::JellyPatchEncoder::new(
+        jelly_fast_core::JellyPatchEncoderOptions::default(),
+    )
+    .expect("encoder");
+    let frames = encoder.encode_ops(ops).expect("encode");
+    let mut decoder = JellyPatchDecoder::new(JellyPatchDecoderOptions::default());
+    let mut decoded = 0;
+    for frame in &frames {
+        let ops = decoder
+            .decode_frame(frame)
+            .unwrap_or_else(|error| panic!("frame of {} rows: {error}", frame.rows.len()));
+        decoded += ops.len();
+    }
+    decoder.finish().expect("finish");
+    decoded
+}
+
+/// The default encoder's own output decodes at default decoder options:
+/// 10,000 alternating one-quad deletes and adds, and 3,000 transactional
+/// updates.
+#[test]
+fn encoder_output_decodes_at_default_options() {
+    let _serial = smoke::measure_alone();
+    // A pool of distinct one-quad batches, cloned (Arc-shared) into ops.
+    let pool: Vec<arrow_array::RecordBatch> = (0..100).map(one_quad_batch).collect();
+    let batch_at = |index: usize| pool[index % pool.len()].clone();
+    let mut alternating = Vec::new();
+    for index in 0..10_000 {
+        let batch = batch_at(index);
+        alternating.push(if index % 2 == 0 {
+            jelly_fast_core::PatchOp::Delete(batch)
+        } else {
+            jelly_fast_core::PatchOp::Add(batch)
+        });
+    }
+    assert_eq!(round_trip_at_defaults(&alternating), 10_000);
+    let mut transactional = Vec::new();
+    for index in 0..3_000 {
+        transactional.push(jelly_fast_core::PatchOp::TransactionStart);
+        transactional.push(jelly_fast_core::PatchOp::Delete(batch_at(index)));
+        transactional.push(jelly_fast_core::PatchOp::Add(batch_at(index + 1)));
+        transactional.push(jelly_fast_core::PatchOp::TransactionCommit);
+    }
+    assert_eq!(round_trip_at_defaults(&transactional), 12_000);
+}
+
+/// A ~4 KB frame of 1,000 alternating one-row runs must allocate a small,
+/// bounded amount (each run used to reserve a ~130 KiB batch builder).
+#[test]
+fn small_frame_of_alternating_runs_allocates_little() {
+    let _serial = smoke::measure_alone();
+    let options = RdfPatchOptions {
+        statement_type: PatchStatementType::Quads.into(),
+        stream_type: PatchStreamType::Flat.into(),
+        generalized_statements: false,
+        rdf_star: false,
+        max_name_table_size: 4000,
+        max_prefix_table_size: 128,
+        max_datatype_table_size: 32,
+        version: PATCH_PROTOCOL_VERSION,
+    };
+    let quad = RdfQuad {
+        subject: Some(rdf_quad::Subject::SIri(iri(1, 1))),
+        predicate: Some(rdf_quad::Predicate::PIri(iri(1, 1))),
+        object: Some(rdf_quad::Object::OIri(iri(1, 1))),
+        graph: Some(rdf_quad::Graph::GDefaultGraph(RdfDefaultGraph {})),
+    };
+    let mut rows = vec![
+        RdfPatchRow {
+            row: Some(rdf_patch_row::Row::Options(options)),
+        },
+        RdfPatchRow {
+            row: Some(rdf_patch_row::Row::Prefix(RdfPrefixEntry {
+                id: 1,
+                value: "http://e/".into(),
+            })),
+        },
+        RdfPatchRow {
+            row: Some(rdf_patch_row::Row::Name(RdfNameEntry {
+                id: 1,
+                value: "x".into(),
+            })),
+        },
+        RdfPatchRow {
+            row: Some(rdf_patch_row::Row::StatementAdd(quad)),
+        },
+    ];
+    for index in 0..1_000 {
+        rows.push(RdfPatchRow {
+            row: Some(if index % 2 == 0 {
+                rdf_patch_row::Row::StatementDelete(RdfQuad::default())
+            } else {
+                rdf_patch_row::Row::StatementAdd(RdfQuad::default())
+            }),
+        });
+    }
+    let frame = RdfPatchFrame { rows };
+    let wire = frame.encode_to_vec().len();
+    let before = smoke::total_allocated();
+    let result = JellyPatchDecoder::new(JellyPatchDecoderOptions::default()).decode_frame(&frame);
+    let spent = smoke::total_allocated().saturating_sub(before);
+    let ops = result.as_ref().map_or(0, Vec::len);
+    eprintln!("{wire} wire bytes, {ops} ops, {spent} bytes allocated");
+    assert_eq!(ops, 1_001, "{result:?}");
+    assert!(
+        spent < 32 << 20,
+        "{wire} wire bytes allocated {spent} bytes"
+    );
+}
+
+fn bad_lookup_quad() -> RdfQuad {
+    RdfQuad {
+        subject: Some(rdf_quad::Subject::SIri(iri(1, 4001))),
+        predicate: Some(rdf_quad::Predicate::PIri(iri(1, 1))),
+        object: Some(rdf_quad::Object::OIri(iri(1, 1))),
+        graph: Some(rdf_quad::Graph::GDefaultGraph(RdfDefaultGraph {})),
+    }
+}
+
+fn good_quad() -> RdfQuad {
+    RdfQuad {
+        subject: Some(rdf_quad::Subject::SIri(iri(1, 1))),
+        predicate: Some(rdf_quad::Predicate::PIri(iri(1, 1))),
+        object: Some(rdf_quad::Object::OIri(iri(1, 1))),
+        graph: Some(rdf_quad::Graph::GDefaultGraph(RdfDefaultGraph {})),
+    }
+}
+
+/// A patch frame that fails partway poisons the decoder: the next frame
+/// and `finish` are refused instead of decoding against half-applied state.
+#[test]
+fn patch_decoder_refuses_frames_after_an_error() {
+    let _serial = smoke::measure_alone();
+    let patch_row = |row| RdfPatchRow { row: Some(row) };
+    let first = RdfPatchFrame {
+        rows: vec![
+            patch_row(rdf_patch_row::Row::Options(RdfPatchOptions {
+                statement_type: PatchStatementType::Quads.into(),
+                stream_type: PatchStreamType::Flat.into(),
+                generalized_statements: false,
+                rdf_star: false,
+                max_name_table_size: 4000,
+                max_prefix_table_size: 128,
+                max_datatype_table_size: 32,
+                version: PATCH_PROTOCOL_VERSION,
+            })),
+            patch_row(rdf_patch_row::Row::Prefix(RdfPrefixEntry {
+                id: 1,
+                value: "http://e/".into(),
+            })),
+            patch_row(rdf_patch_row::Row::Name(RdfNameEntry {
+                id: 1,
+                value: "x".into(),
+            })),
+            patch_row(rdf_patch_row::Row::TransactionStart(
+                jelly_fast_core::proto::patch::RdfPatchTransactionStart {},
+            )),
+            patch_row(rdf_patch_row::Row::StatementAdd(good_quad())),
+            patch_row(rdf_patch_row::Row::StatementAdd(bad_lookup_quad())),
+        ],
+    };
+    let second = RdfPatchFrame {
+        rows: vec![
+            patch_row(rdf_patch_row::Row::StatementAdd(good_quad())),
+            patch_row(rdf_patch_row::Row::TransactionCommit(
+                jelly_fast_core::proto::patch::RdfPatchTransactionCommit {},
+            )),
+        ],
+    };
+    let mut decoder = JellyPatchDecoder::new(JellyPatchDecoderOptions::default());
+    let failed = decoder.decode_frame(&first);
+    assert!(matches!(failed, Err(JellyError::Lookup(_))), "{failed:?}");
+    let next = decoder.decode_frame(&second);
+    assert!(next.is_err(), "frame after a failure decoded: {next:?}");
+    let finished = decoder.finish();
+    assert!(finished.is_err(), "finish after a failure: {finished:?}");
+}
+
+/// The same for the stream decoder.
+#[test]
+fn stream_decoder_refuses_frames_after_an_error() {
+    let _serial = smoke::measure_alone();
+    let first = frame(vec![
+        row(rdf_stream_row::Row::Options(stream_options(
+            128, 4000, 32, false,
+        ))),
+        row(rdf_stream_row::Row::Prefix(RdfPrefixEntry {
+            id: 1,
+            value: "http://e/".into(),
+        })),
+        row(rdf_stream_row::Row::Name(RdfNameEntry {
+            id: 1,
+            value: "x".into(),
+        })),
+        row(rdf_stream_row::Row::Quad(good_quad())),
+        row(rdf_stream_row::Row::Quad(bad_lookup_quad())),
+    ]);
+    let second = frame(vec![row(rdf_stream_row::Row::Quad(good_quad()))]);
+    let mut decoder = JellyDecoder::new(JellyDecoderOptions::default());
+    let failed = decoder.decode_frame(&first);
+    assert!(matches!(failed, Err(JellyError::Lookup(_))), "{failed:?}");
+    let next = decoder.decode_frame(&second);
+    assert!(next.is_err(), "frame after a failure decoded: {next:?}");
 }
