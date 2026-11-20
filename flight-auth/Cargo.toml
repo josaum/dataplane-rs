@@ -15,7 +15,7 @@ publish.workspace = true
 # parsers-rs: `rust_crypto` pulls `rsa` 0.9, which carries RUSTSEC-2023-0071
 # with no fix on that line, and the audit ignores no advisory. This crate is
 # the only user, so no other member can turn on a second backend.
-jsonwebtoken = { version = "=11.1.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "=12.0.0", features = ["aws_lc_rs"] }
 # Not used directly. The `aws_lc_rs` backend builds AWS-LC, whose x86_64
 # Windows assembly needs NASM. This feature lets that one target fall back to
 # the assembled objects the crate ships when NASM is not installed; it changes
