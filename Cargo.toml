@@ -48,7 +48,7 @@ arrow = { version = "=58.4.1", features = ["ipc_compression"] }
 arrow-array = "=58.4.1"
 arrow-flight = "=58.4.1"
 arrow-ipc = { version = "=58.4.1", features = ["lz4", "zstd"] }
-arrow-schema = "=58.4.1"
+arrow-schema = "=58.4.2"
 bytes = "1"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 futures = "0.3"
